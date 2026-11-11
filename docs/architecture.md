@@ -120,7 +120,8 @@ scan session scope: interface and/or target prefix, methods, limits
         |
         v
 providers run concurrently, each emitting normalized observations
-  neighbour table | ICMP echo | reverse DNS | mDNS | SSDP | NetBIOS | TCP probes
+  Phase 1: neighbour table | ICMP echo | TCP connect | reverse DNS
+  later:   mDNS | SSDP | NetBIOS | service banners
         |
         v
 observation stream (facts only, with source, method, timestamp, details)
@@ -295,8 +296,8 @@ need is demonstrated.
 ### D6 — OUI data is loaded from the IEEE registry, not a lookup crate
 
 The `oui` crate depends on the unmaintained `failure` crate; `mac_oui` embeds data with
-unclear licensing. NetAtlas will ship a versioned IEEE MA-L/MA-M/MA-S CSV snapshot,
-load it into SQLite, and record source, version, import time, and content hash.
+unclear licensing. NetAtlas ships a versioned IEEE MA-L/MA-M/MA-S CSV snapshot, loads
+it into SQLite, and records source, version, import time, and content hash.
 
 OUI lookup is longest-prefix match and is always reported as manufacturer association,
 not model or ownership.
@@ -307,6 +308,9 @@ Use `hickory-resolver` 0.26 for queries and `Lookup::message()` for RCODE, flags
 per-record TTL. Enable `dnssec-ring` and use hickory-proto validation primitives to
 produce an explicit state: `secure`, `insecure`, `bogus`, `indeterminate`, `unsupported`.
 Presence of DNSKEY/DS/RRSIG records is never reported as successful validation.
+
+Phase 1 uses hickory only for reverse-DNS PTR lookups in discovery. The validation
+states belong to the DNS diagnostics phase and are not reported by `discover`.
 
 Alternative: a hand-written DNS client. Rejected: too much protocol surface for the value.
 
@@ -368,9 +372,9 @@ state.
 ### D16 — One SQLite source per OUI import, latest wins
 
 An OUI import is a new `oui_sources` row with its own hash and record set. Lookups use
-the most recent source (ordered by import time and UUIDv7 ID). Old sources remain for
-provenance instead of being destructively replaced. `oui_entries` loads only the latest
-source for in-memory lookup.
+`oui_prefixes` rows from the most recent source (ordered by import time and UUIDv7 ID).
+Old sources remain for provenance instead of being destructively replaced. The
+in-memory `oui_entries()` loader reads only the latest source.
 
 ### D17 — SQLite writes stay on the scan task for now
 

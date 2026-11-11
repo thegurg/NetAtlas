@@ -131,6 +131,10 @@ pub enum Source {
 }
 ```
 
+Phase 1 emits only `Ip`, `Mac`, and `DnsName` identifiers and the sources
+`NeighborTable`, `IcmpEcho`, `TcpProbe`, `ReverseDns`, and `OuiRegistry`. The other
+variants are reserved for the protocols described in later phases.
+
 ## 3. Identity model
 
 ### 3.1 Identifiers and validity
@@ -142,26 +146,32 @@ duplicate hostnames), so `(kind, normalized)` is not unique. Queries select by
 
 ### 3.2 Linking rules
 
-When a new observation arrives, candidate devices are resolved in this order:
+Phase 1 implements a deliberately conservative subset. When a host observation is
+resolved, the rules are applied in this order:
 
-1. **Strong stable identifiers** — UPnP UDN, SSH host key fingerprint, TLS certificate
-   fingerprint, mDNS instance name (full service instance), NetBIOS name combined with
-   segment. Exact match within the freshness window links to that device.
-2. **MAC address** — a globally administered MAC match within the MAC freshness window
-   (default 24 h, configurable) links to the device that last held it. A logical device
-   may legitimately have multiple active MACs (for example Ethernet and Wi-Fi), but
-   multiple MACs are merged only when a strong identifier or stable co-observation
-   corroborates the link; otherwise they remain separate devices with an `uncertain`
-   link candidate.
-3. **Hostname / DNS name** — a match is only a candidate. It may corroborate a link but
-   never merges devices on its own.
-4. **IP address** — never sufficient to merge. If an IP is seen with a different MAC,
-   record `address_reuse_suspected` and keep separate devices.
-5. **Ambiguity** — if a new observation matches two devices, do not merge. Create an
-   `identity_links` row with status `uncertain` and explain the competing matches.
+1. **Same MAC in the current scan** — two addresses observed with the same MAC in one
+   scan are one device.
+2. **Global MAC** — a globally administered MAC matching a stored device within the MAC
+   freshness window (default 24 h) links to the most recently seen matching device. A
+   device that changes IP therefore keeps its identity.
+3. **Locally administered MAC** — never merges. A new logical device is created; if the
+   address matched a stored device, an `uncertain` link with basis
+   `locally_administered_mac` preserves the possible relationship.
+4. **IP address** — never sufficient to merge. If an address is observed with a
+   different MAC, NetAtlas creates a separate device, records an
+   `address_reuse_suspected` observation, and adds an `uncertain` link with basis
+   `address_reuse`. If only an IP matches a stored device, it creates a separate device
+   and an `uncertain` link with basis `ip_only`.
+5. **Hostname / DNS name** — recorded as a low-confidence identifier. It never merges
+   devices on its own.
+6. **Ambiguous MAC match** — if one global MAC matches multiple stored devices, the most
+   recently seen device is reused and the competing matches receive `uncertain` links
+   with basis `ambiguous_mac`. No automatic merge occurs.
 
-A device changing IP keeps its identity because the MAC (or stronger identifier) links
-it. Two devices reusing an IP stay separate because IP alone never merges.
+Strong stable identifiers (UPnP UDN, SSH host key fingerprint, TLS certificate
+fingerprint, mDNS instance name, NetBIOS name) are part of the design but are not
+observed by any Phase 1 provider. They will extend this order ahead of MAC once the
+corresponding providers exist.
 
 ### 3.3 Locally administered MAC addresses
 
@@ -171,8 +181,8 @@ administered. NetAtlas records this and:
 - does not present OUI output as the device manufacturer;
 - labels the condition `locally_administered_mac` (not automatically "randomized",
   because hypervisors and manually assigned addresses also set this bit);
-- requires corroborating identifiers for identity links when the MAC is the only
-  candidate.
+- never merges devices on a locally administered MAC alone. Phase 1 records an
+  `uncertain` link instead, even when the address matches exactly.
 
 ### 3.4 Uncertain links
 
@@ -205,6 +215,9 @@ oui:<prefix>:<db-version>
 icmp:<address>:<session-id>
 ```
 
+Phase 1 emits `oui:<prefix-hex>:<snapshot-version>` for OUI evidence. The other forms
+are reserved for the providers that will produce them.
+
 Two fields extracted from the same SSDP description share one `source_unit` and count
 as one source. A second, independent protocol observation gets a different unit.
 
@@ -232,8 +245,13 @@ Observation (fact):
 ```json
 {
   "kind": "neighbor_entry",
-  "subject": {"type": "segment", "id": "..."},
-  "value": {"ip": "192.168.1.42", "mac": "3c:cd:5d:11:22:33", "state": "REACHABLE"},
+  "subject": {"type": "device", "id": "..."},
+  "value": {
+    "ip": "192.168.1.42",
+    "mac": "3c:cd:5d:11:22:33",
+    "state": "reachable",
+    "interface": "wlo1"
+  },
   "source": "neighbor_table",
   "method": "netlink_rtm_getneigh",
   "observed_at_ms": 1790000000000
@@ -247,9 +265,9 @@ Evidence (supports a property):
   "property": "manufacturer",
   "candidate": "Xiaomi Communications Co Ltd",
   "source": "oui_registry",
-  "source_unit": "oui:3ccd5d:ieee-2026-11",
+  "source_unit": "oui:3ccd5d:2026-11-11",
   "confidence": "medium",
-  "rationale": "MAC prefix 3C:CD:5D is registered to Xiaomi; this is an address allocation, not proof of the device model."
+  "rationale": "MAC prefix 3CCD5D/24 is registered to Xiaomi Communications Co Ltd in the IEEE registry. This is an address-block association, not proof of the device model or owner."
 }
 ```
 
@@ -262,14 +280,14 @@ Inference (conclusion):
   "confidence": "medium",
   "status": "supported",
   "evidence_ids": ["..."],
-  "rationale": "Single OUI association; no independent corroboration."
+  "rationale": "Supported by 1 independent source unit(s): oui:3ccd5d:2026-11-11."
 }
 ```
 
 ## 5. SQLite schema
 
-Migration `0001_discovery.sql` (Phase 1). DNS, route, and monitoring tables are added
-by later migrations.
+Migration `0001_discovery.sql` (Phase 1), plus the migration ledger and connection
+pragmas. DNS, route, and monitoring tables are added by later migrations.
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -280,14 +298,9 @@ CREATE TABLE schema_migrations (
     applied_at_ms INTEGER NOT NULL
 );
 
-CREATE TABLE app_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
 CREATE TABLE interfaces (
     id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
+    name          TEXT NOT NULL UNIQUE,
     index_no      INTEGER,
     mac           TEXT,
     mtu           INTEGER,
@@ -409,6 +422,7 @@ CREATE TABLE inferences (
     status           TEXT NOT NULL CHECK (status IN ('supported','conflicted','unknown')),
     rationale        TEXT NOT NULL,
     evidence_ids_json TEXT NOT NULL,
+    unknown_reason   TEXT,
     computed_at_ms   INTEGER NOT NULL
 );
 CREATE INDEX idx_inference_device ON inferences(device_id, property, computed_at_ms);
@@ -444,8 +458,6 @@ CREATE TABLE oui_prefixes (
     prefix_hex   TEXT NOT NULL,
     prefix_bits  INTEGER NOT NULL,
     organization TEXT NOT NULL,
-    address      TEXT,
-    country      TEXT,
     source_id    TEXT NOT NULL REFERENCES oui_sources(id) ON DELETE CASCADE,
     PRIMARY KEY (prefix_hex, prefix_bits, source_id)
 );
@@ -463,14 +475,21 @@ These are not created until their modules exist.
 
 ## 6. Migrations and integrity
 
+Implemented in Phase 1:
+
 - Migrations are numbered SQL files embedded in the binary, applied inside a
-  transaction, in order. `PRAGMA user_version` and `schema_migrations` must agree.
-- A migration failure rolls back and leaves the previous version intact.
+  transaction, in order. `PRAGMA user_version` records the applied version; a database
+  newer than the binary is rejected.
+- A migration failure rolls back that migration and leaves the previous version intact.
 - Foreign keys are enabled on every connection.
 - WAL mode is enabled for concurrent reads while a scan writes.
-- The writer serializes writes; readers use separate connections.
-- On startup, a session left in `running` from a previous process is marked
-  `interrupted`; its observations remain valid.
+- One scan writes its records in one transaction. The writer serializes writes; readers
+  use separate connections.
+
+Deferred:
+
+- The startup sweep that marks a session left in `running` from a previous process as
+  `interrupted` is not implemented. Its observations would remain valid.
 - Destructive migrations require an explicit backup step and are avoided otherwise.
 
 ## 7. Retention and freshness

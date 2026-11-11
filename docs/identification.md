@@ -1,6 +1,9 @@
 # NetAtlas device identification strategy
 
-Status: Phase 0 design. Not implemented yet.
+Status: Phase 1 implements identity resolution plus evidence and inference for the
+manufacturer property from the IEEE OUI registry. Category, OS, and model are always
+reported as `unknown` because no Phase 1 provider observes evidence for them. The
+mDNS, SSDP, NetBIOS, and service-banner rules below are design targets for later phases.
 
 ## 1. Objective
 
@@ -36,7 +39,9 @@ profile + explanation -> CLI/TUI fields with evidence links and unknown reasons
 ```
 
 The identification engine is a pure function over observations, a clock, and the OUI
-index. It performs no I/O and is tested entirely from fixtures.
+index. It performs no I/O and is tested entirely from fixtures. Phase 1 implements the
+pipeline end to end for OUI evidence; the later protocol stages are represented by the
+same observation and evidence types.
 
 ## 3. Evidence classes and reliability
 
@@ -62,9 +67,19 @@ for that property.
 
 `high` is never assigned from a single self-reported field. See the aggregation rubric.
 
+**Phase 1 implementation:** only the OUI registry row is active. Neighbour table, ICMP,
+TCP, and reverse DNS observations are collected, but they intentionally support no
+device property other than presence, RTT, and naming. The other rows describe the
+providers planned for Phase 2 and later; they must not be presented as implemented.
+
 ## 4. Property rules
 
 ### 4.1 Manufacturer / vendor
+
+Phase 1 implements the OUI rule and the locally-administered rule. The agreement and
+conflict rules are implemented in the aggregation layer and covered by synthetic
+evidence tests, but no Phase 1 provider supplies the protocol fields needed to exercise
+them against a real device.
 
 - OUI lookup yields a **manufacturer association** with `medium` confidence. The UI
   labels it as an OUI association; it is not proof of the device's manufacturer or
@@ -78,6 +93,9 @@ for that property.
 - A model is never derived from OUI data.
 
 ### 4.2 Device category
+
+**Phase 1:** no provider supplies category evidence, so every device reports
+`unknown` with reason `no_evidence`.
 
 Candidate categories:
 
@@ -101,6 +119,9 @@ Rules:
 
 ### 4.3 Operating system
 
+**Phase 1:** no provider supplies OS evidence, so OS is `unknown` with reason
+`no_evidence`. TTL is not collected as an OS signal.
+
 - OS is `unknown` by default.
 - SSH/HTTP banners can support an OS *family* at `medium` when the string is explicit
   (`OpenSSH ... Ubuntu`, `Server: Microsoft-IIS`).
@@ -114,6 +135,9 @@ Rules:
 
 ### 4.4 Model
 
+**Phase 1:** no provider supplies model evidence, so model is `unknown` with reason
+`no_evidence`.
+
 - The model is `unknown` unless a protocol explicitly exposes it: UPnP `modelName` /
   `modelNumber`, mDNS TXT `model`, or a product string in a service description.
 - An explicit model is `medium` by default because it is self-reported.
@@ -122,6 +146,9 @@ Rules:
 - NetAtlas never infers a phone model from a MAC address, OUI, port set, or hostname.
 
 ### 4.5 Services
+
+**Phase 1:** service observations are not collected. The `services` table exists for
+later phases.
 
 Services are recorded as their own observations (port, transport, protocol, product,
 version, banner, TLS metadata, source, timestamp). A service observation can support a
@@ -210,33 +237,37 @@ link back to observations with their raw/normalized values.
 ## 9. Acceptance tests (fixtures, no live network)
 
 The identification milestone is complete only when these scenarios pass deterministically.
+The status column records what Phase 1 covers; `deferred` scenarios are not claimed as
+working functionality.
 
-| # | Scenario | Expected |
-| --- | --- | --- |
-| 1 | ARP/neighbour entry only, globally administered MAC | Device exists; manufacturer from OUI `medium`; category/OS/model `unknown` with `no_evidence` |
-| 2 | UPnP media-renderer fixture with manufacturer + model + deviceType | Manufacturer/model/category supported with source units and rationale |
-| 3 | UPnP says media renderer, mDNS says printer | Category `conflicted`; both candidates retained; confidence lowered |
-| 4 | Locally administered MAC | No OUI manufacturer; reason `locally_administered_mac` |
-| 5 | Same IP, different MAC across sessions | Two devices; `address_reuse_suspected` event; no merge |
-| 6 | Same MAC, new IP | Same device; new IP identifier; history preserved |
-| 7 | Two fields from one SSDP description agree | Counted as one source unit; no confidence bump |
-| 8 | OUI + explicit UPnP manufacturer agree | Manufacturer `high`, both units listed |
-| 9 | OUI says vendor A, UPnP says vendor B | Manufacturer `conflicted`, both preserved |
-| 10 | mDNS provider disabled | Other evidence still produces a profile; session `partial`; reason `provider_unavailable` |
-| 11 | Evidence older than freshness window | Property `unknown` with `stale_evidence` |
-| 12 | Hostname "iPhone" with no other evidence | Category at most `low`, not a confirmed smartphone |
-| 13 | TTL value only | OS stays `unknown`; TTL is not used as OS evidence |
-| 14 | Duplicate hostname on two MACs | No merge; hostname identifier shared with conflict note |
-| 15 | Malformed SSDP/mDNS fixture | Provider error recorded; no panic; other providers unaffected |
+| # | Scenario | Expected | Phase 1 status |
+| --- | --- | --- | --- |
+| 1 | ARP/neighbour entry only, globally administered MAC | Device exists; manufacturer from OUI `medium`; category/OS/model `unknown` with `no_evidence` | Implemented |
+| 2 | UPnP media-renderer fixture with manufacturer + model + deviceType | Manufacturer/model/category supported with source units and rationale | Deferred (no UPnP provider) |
+| 3 | UPnP says media renderer, mDNS says printer | Category `conflicted`; both candidates retained; confidence lowered | Deferred (aggregation supports it; no providers) |
+| 4 | Locally administered MAC | No OUI manufacturer; reason `locally_administered_mac` | Implemented |
+| 5 | Same IP, different MAC across sessions | Two devices; `address_reuse_suspected` event; no merge | Implemented |
+| 6 | Same MAC, new IP | Same device; new IP identifier; history preserved | Implemented |
+| 7 | Two fields from one SSDP description agree | Counted as one source unit; no confidence bump | Aggregation implemented and tested; SSDP provider deferred |
+| 8 | OUI + explicit UPnP manufacturer agree | Manufacturer `high`, both units listed | Aggregation implemented and tested; UPnP provider deferred |
+| 9 | OUI says vendor A, UPnP says vendor B | Manufacturer `conflicted`, both preserved | Aggregation implemented and tested; UPnP provider deferred |
+| 10 | mDNS provider disabled | Other evidence still produces a profile; session `partial`; reason `provider_unavailable` | Deferred (no mDNS provider) |
+| 11 | Evidence older than freshness window | Property `unknown` with `stale_evidence` | Implemented in inference aggregation |
+| 12 | Hostname "iPhone" with no other evidence | Category at most `low`, not a confirmed smartphone | Implemented by absence: Phase 1 never derives category from hostnames |
+| 13 | TTL value only | OS stays `unknown`; TTL is not used as OS evidence | Implemented by absence: TTL is not collected |
+| 14 | Duplicate hostname on two MACs | No merge; hostname identifier shared with conflict note | No-merge rule implemented; conflict note not yet surfaced |
+| 15 | Malformed SSDP/mDNS fixture | Provider error recorded; no panic; other providers unaffected | Deferred (no SSDP/mDNS providers) |
 
 Additional property tests:
 
 - Confidence aggregation is monotonic and capped; conflicting evidence never increases
-  confidence.
-- `source_unit` grouping is stable and deterministic.
-- Every non-unknown inference has at least one evidence ID.
-- Every unknown inference has a reason.
-- Serialization round-trip preserves evidence and status.
+  confidence. — implemented in `domain::inference` tests.
+- `source_unit` grouping is stable and deterministic. — implemented in
+  `domain::inference` tests.
+- Every non-unknown inference has at least one evidence ID. — holds for the OUI path.
+- Every unknown inference has a reason. — implemented.
+- Serialization round-trip preserves evidence and status. — deferred; not yet a
+  dedicated test.
 
 ## 10. Explicit non-goals
 

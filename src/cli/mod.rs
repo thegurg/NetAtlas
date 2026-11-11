@@ -388,10 +388,7 @@ fn print_interfaces(context: &NetworkContext) {
                     .gateway
                     .map(|gateway| gateway.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                route
-                    .interface
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
+                route.interface.clone().unwrap_or_else(|| "-".to_string()),
                 route
                     .metric
                     .map(|metric| metric.to_string())
