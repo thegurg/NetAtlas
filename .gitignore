@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Local NetAtlas data (never commit a user's network history)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local environment overrides
+.env
+.env.local
+
+# Editor/OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
