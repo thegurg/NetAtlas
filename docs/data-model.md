@@ -1,7 +1,7 @@
 # NetAtlas data model
 
-Status: Phase 0 design. Schema shown here is the target for migrations; it is not yet
-created.
+Status: Phase 1. Migration `0001_discovery` is implemented and applied automatically.
+Later DNS, route, and monitoring tables do not exist yet.
 
 ## 1. Modeling principles
 
@@ -86,8 +86,8 @@ pub struct Observation {
 pub struct Evidence {
     pub id: EvidenceId,
     pub observation_id: ObservationId,
-    pub device_id: Option<DeviceId>,
-    pub property: Property,           // manufacturer / category / os / model / hostname
+    pub device_id: DeviceId,
+    pub property: Property,           // manufacturer / category / os / model
     pub candidate: serde_json::Value,
     pub source: Source,
     pub source_unit: String,          // independence key
@@ -108,6 +108,7 @@ pub struct Inference {
     pub status: InferenceStatus,
     pub rationale: String,
     pub evidence_ids: Vec<EvidenceId>,
+    pub unknown_reason: Option<UnknownReason>,
     pub computed_at_ms: i64,
 }
 ```

@@ -17,9 +17,7 @@ use crate::domain::{
     IdentityLink, InferenceRecord, InferenceStatus, InferenceView, MacAddress, ObservationRecord,
     UnknownReason, ids::new_id, time::now_ms,
 };
-use crate::infrastructure::oui::{
-    self, OuiEntry, OuiError, OuiParseResult, OuiSourceMeta,
-};
+use crate::infrastructure::oui::{self, OuiEntry, OuiError, OuiParseResult, OuiSourceMeta};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -33,7 +31,7 @@ pub enum StorageError {
     InvalidValue(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct OuiSourceRow {
     pub id: String,
     pub name: String,
@@ -44,7 +42,7 @@ pub struct OuiSourceRow {
     pub record_count: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct OuiMatchRow {
     pub prefix_hex: String,
     pub prefix_bits: u8,
@@ -181,7 +179,7 @@ impl Store {
         self.connection
             .query_row(
                 "SELECT id, name, version, source_url, content_sha256, imported_at_ms, record_count
-                 FROM oui_sources ORDER BY imported_at_ms DESC LIMIT 1",
+                 FROM oui_sources ORDER BY imported_at_ms DESC, id DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(OuiSourceRow {
@@ -214,7 +212,7 @@ impl Store {
                      FROM oui_prefixes p
                      JOIN oui_sources s ON s.id = p.source_id
                      WHERE p.prefix_bits = ?1 AND p.prefix_hex = ?2
-                     ORDER BY s.imported_at_ms DESC LIMIT 1",
+                     ORDER BY s.imported_at_ms DESC, s.id DESC LIMIT 1",
                     params![bits as i64, prefix],
                     |row| {
                         Ok(OuiMatchRow {
@@ -231,6 +229,35 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// Load the prefixes from the most recent OUI source for in-memory lookup.
+    pub fn oui_entries(&self) -> Result<Vec<OuiEntry>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT prefix_hex, prefix_bits, organization
+             FROM oui_prefixes
+             WHERE source_id = (SELECT id FROM oui_sources ORDER BY imported_at_ms DESC, id DESC LIMIT 1)",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(OuiEntry {
+                prefix_hex: row.get(0)?,
+                prefix_bits: row.get::<_, i64>(1)? as u8,
+                organization: row.get(2)?,
+            })
+        })?;
+        let mut unique: HashMap<(String, u8), OuiEntry> = HashMap::new();
+        for row in rows {
+            let entry = row?;
+            unique.insert((entry.prefix_hex.clone(), entry.prefix_bits), entry);
+        }
+        let mut entries: Vec<OuiEntry> = unique.into_values().collect();
+        entries.sort_by(|left, right| {
+            right
+                .prefix_bits
+                .cmp(&left.prefix_bits)
+                .then_with(|| left.prefix_hex.cmp(&right.prefix_hex))
+        });
+        Ok(entries)
     }
 
     pub fn load_existing_devices(
@@ -275,10 +302,10 @@ impl Store {
 
             match kind.as_str() {
                 "mac" => {
-                    if identifier_last_seen >= now_ms - mac_window_ms {
-                        if let Ok(mac) = value.parse::<MacAddress>() {
-                            entry.macs.push((mac, identifier_last_seen));
-                        }
+                    if identifier_last_seen >= now_ms - mac_window_ms
+                        && let Ok(mac) = value.parse::<MacAddress>()
+                    {
+                        entry.macs.push((mac, identifier_last_seen));
                     }
                 }
                 "ip" => {
@@ -396,7 +423,11 @@ impl Store {
                     .query_row(
                         "SELECT id FROM interface_addresses
                          WHERE interface_id = ?1 AND address = ?2 AND prefix_len = ?3",
-                        params![interface_id, address.address.to_string(), address.prefix_len as i64],
+                        params![
+                            interface_id,
+                            address.address.to_string(),
+                            address.prefix_len as i64
+                        ],
                         |row| row.get(0),
                     )
                     .optional()?;
@@ -647,10 +678,10 @@ impl Store {
         let mut summaries = Vec::new();
         for row in rows {
             let id = row?;
-            if let Some(filter) = &session_devices {
-                if !filter.contains(&id) {
-                    continue;
-                }
+            if let Some(filter) = &session_devices
+                && !filter.contains(&id)
+            {
+                continue;
             }
             if let Some(summary) = self.load_summary(&id)? {
                 summaries.push(summary);
@@ -658,8 +689,14 @@ impl Store {
         }
 
         summaries.sort_by(|left, right| {
-            let left_ip = left.ips.first().and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
-            let right_ip = right.ips.first().and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+            let left_ip = left
+                .ips
+                .first()
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+            let right_ip = right
+                .ips
+                .first()
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
             left_ip
                 .cmp(&right_ip)
                 .then_with(|| right.last_seen_ms.cmp(&left.last_seen_ms))
@@ -688,7 +725,7 @@ impl Store {
         };
 
         let mut identifiers = self.load_identifiers(device_id)?;
-        identifiers.sort_by(|left, right| right.last_seen_ms.cmp(&left.last_seen_ms));
+        identifiers.sort_by_key(|left| std::cmp::Reverse(left.last_seen_ms));
 
         let ips = identifiers
             .iter()
@@ -745,15 +782,17 @@ impl Store {
                     .map_err(|error: crate::domain::DomainError| {
                         StorageError::InvalidValue(error.to_string())
                     })?,
-                status: status.parse().map_err(|error: crate::domain::DomainError| {
-                    StorageError::InvalidValue(error.to_string())
-                })?,
+                status: status
+                    .parse()
+                    .map_err(|error: crate::domain::DomainError| {
+                        StorageError::InvalidValue(error.to_string())
+                    })?,
                 unknown_reason: match unknown_reason {
-                    Some(value) => Some(value.parse().map_err(
-                        |error: crate::domain::DomainError| {
+                    Some(value) => {
+                        Some(value.parse().map_err(|error: crate::domain::DomainError| {
                             StorageError::InvalidValue(error.to_string())
-                        },
-                    )?),
+                        })?)
+                    }
                     None => None,
                 },
                 rationale,
@@ -805,28 +844,25 @@ impl Store {
             Ok(IdentifierRecord {
                 id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                 device_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
-                kind: row
-                    .get::<_, String>(2)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                kind: row.get::<_, String>(2)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 value: row.get(3)?,
                 normalized: row.get(4)?,
-                source: row
-                    .get::<_, String>(5)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                source: row.get::<_, String>(5)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 first_seen_ms: row.get(6)?,
                 last_seen_ms: row.get(7)?,
-                confidence: row
-                    .get::<_, String>(8)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                confidence: row.get::<_, String>(8)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 details: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or(Value::Null),
             })
         })?;
@@ -870,27 +906,23 @@ impl Store {
                 id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                 observation_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
                 device_id: Uuid::parse_str(&row.get::<_, String>(2)?).unwrap_or_default(),
-                property: row
-                    .get::<_, String>(3)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                property: row.get::<_, String>(3)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
-                candidate: serde_json::from_str(&row.get::<_, String>(4)?)
-                    .unwrap_or(Value::Null),
-                source: row
-                    .get::<_, String>(5)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                    },
+                )?,
+                candidate: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or(Value::Null),
+                source: row.get::<_, String>(5)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 source_unit: row.get(6)?,
-                confidence: row
-                    .get::<_, String>(7)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                confidence: row.get::<_, String>(7)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 rationale: row.get(8)?,
                 observed_at_ms: row.get(9)?,
                 expires_at_ms: row.get(10)?,
@@ -917,33 +949,28 @@ impl Store {
                 session_id: row
                     .get::<_, Option<String>>(1)?
                     .and_then(|value| Uuid::parse_str(&value).ok()),
-                subject_type: row
-                    .get::<_, String>(2)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                subject_type: row.get::<_, String>(2)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 subject_id: row.get(3)?,
-                kind: row
-                    .get::<_, String>(4)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                kind: row.get::<_, String>(4)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 property: row.get(5)?,
-                value: serde_json::from_str(&row.get::<_, String>(6)?)
-                    .unwrap_or(Value::Null),
-                source: row
-                    .get::<_, String>(7)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                value: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(Value::Null),
+                source: row.get::<_, String>(7)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 method: row.get(8)?,
                 observed_at_ms: row.get(9)?,
                 expires_at_ms: row.get(10)?,
-                details: serde_json::from_str(&row.get::<_, String>(11)?)
-                    .unwrap_or(Value::Null),
+                details: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or(Value::Null),
             })
         })?;
         let mut observations = Vec::new();
@@ -963,36 +990,32 @@ impl Store {
             Ok(InferenceRecord {
                 id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                 device_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
-                property: row
-                    .get::<_, String>(2)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                property: row.get::<_, String>(2)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 value: row
                     .get::<_, Option<String>>(3)?
                     .and_then(|value| serde_json::from_str::<Value>(&value).ok()),
-                confidence: row
-                    .get::<_, String>(4)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                confidence: row.get::<_, String>(4)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
-                status: row
-                    .get::<_, String>(5)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                    },
+                )?,
+                status: row.get::<_, String>(5)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 rationale: row.get(6)?,
-                evidence_ids: serde_json::from_str(&row.get::<_, String>(7)?)
-                    .unwrap_or_default(),
+                evidence_ids: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
                 unknown_reason: match row.get::<_, Option<String>>(8)? {
-                    Some(value) => Some(value.parse().map_err(
-                        |error: crate::domain::DomainError| {
+                    Some(value) => {
+                        Some(value.parse().map_err(|error: crate::domain::DomainError| {
                             rusqlite::Error::InvalidParameterName(error.to_string())
-                        },
-                    )?),
+                        })?)
+                    }
                     None => None,
                 },
                 computed_at_ms: row.get(9)?,
@@ -1019,18 +1042,16 @@ impl Store {
                 from_device_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
                 to_device_id: Uuid::parse_str(&row.get::<_, String>(2)?).unwrap_or_default(),
                 basis: row.get(3)?,
-                confidence: row
-                    .get::<_, String>(4)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                confidence: row.get::<_, String>(4)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
-                status: row
-                    .get::<_, String>(5)?
-                    .parse()
-                    .map_err(|error: crate::domain::DomainError| {
+                    },
+                )?,
+                status: row.get::<_, String>(5)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
-                    })?,
+                    },
+                )?,
                 rationale: row.get(6)?,
                 created_at_ms: row.get(7)?,
             })
@@ -1061,4 +1082,152 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+
+    use super::Store;
+    use crate::application::identify;
+    use crate::application::identity;
+    use crate::application::model::{
+        DiscoveryMethod, ScanConfig, ScanResult, ScanScope, SessionStatus,
+    };
+    use crate::domain::{
+        HostObservation, HostProbe, IdentifierKind, InferenceStatus, NetworkContext, Source,
+        ids::new_id,
+    };
+
+    fn sample_scan() -> ScanResult {
+        let now = 1_000_000_i64;
+        let session_id = new_id();
+        let ip: IpAddr = "192.168.1.10".parse().unwrap();
+        let mac = "00:11:22:33:44:55".parse().unwrap();
+        let probe = HostProbe::neighbor(ip, Some(mac), Some("reachable".into()), Some("eth0"), now);
+        let host = HostObservation {
+            ip,
+            interface: Some("eth0".into()),
+            segment: None,
+            mac: Some(mac),
+            neighbor_state: Some("reachable".into()),
+            icmp_rtt_ms: None,
+            tcp: Vec::new(),
+            hostname: None,
+            first_seen_ms: now,
+            last_seen_ms: now,
+            sources: vec![Source::NeighborTable],
+            probes: vec![probe],
+        };
+        let resolved = identity::resolve(
+            std::slice::from_ref(&host),
+            &[],
+            now,
+            identity::DEFAULT_MAC_WINDOW_MS,
+        );
+        let identification = identify::identify(session_id, &resolved.devices, &[], "test", now);
+        ScanResult {
+            session_id,
+            started_at_ms: now,
+            finished_at_ms: now,
+            status: SessionStatus::Completed,
+            scope: ScanScope {
+                interface: Some("eth0".into()),
+                target: Some("192.168.1.0/24".into()),
+                candidate_count: 254,
+                discovered_count: 1,
+            },
+            config: ScanConfig {
+                timeout_ms: 1_000,
+                dns_timeout_ms: 1_500,
+                concurrency: 4,
+                max_hosts: 1_024,
+                methods: vec![DiscoveryMethod::Neighbor],
+            },
+            context: NetworkContext {
+                interfaces: Vec::new(),
+                routes: Vec::new(),
+                neighbors: Vec::new(),
+                default_interface: None,
+                default_gateway: None,
+                warnings: Vec::new(),
+                captured_at_ms: now,
+            },
+            hosts: vec![host],
+            devices: resolved.devices,
+            observations: identification.observations,
+            evidence: identification.evidence,
+            inferences: identification.inferences,
+            identity_links: resolved.links,
+            provider_reports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn saves_and_loads_a_scan_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        let scan = sample_scan();
+        let device_id = scan.devices[0].id;
+        store.save_scan(&scan).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), 1);
+
+        let devices = store.list_devices(None).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, device_id);
+        assert!(devices[0].ips.contains(&"192.168.1.10".to_string()));
+        assert!(devices[0].macs.contains(&"00:11:22:33:44:55".to_string()));
+        assert_eq!(devices[0].manufacturer.status, InferenceStatus::Unknown);
+
+        let detail = store.get_device(device_id).unwrap().unwrap();
+        assert_eq!(detail.identifiers.len(), 2);
+        assert!(
+            detail
+                .identifiers
+                .iter()
+                .any(|identifier| identifier.kind == IdentifierKind::Ip)
+        );
+        assert!(
+            detail
+                .identifiers
+                .iter()
+                .any(|identifier| identifier.kind == IdentifierKind::Mac)
+        );
+        assert_eq!(detail.inferences.len(), 4);
+        assert!(!detail.observations.is_empty());
+        assert_eq!(detail.summary.last_session_id, Some(scan.session_id));
+    }
+
+    #[test]
+    fn imports_oui_csv_and_uses_longest_prefix() {
+        let mut store = Store::open_in_memory().unwrap();
+        let fixture = "Registry,Assignment,Organization Name\nMA-L,001122,Example Networks\nMA-S,001122334,Example Sensors\n";
+        let report = store.import_oui_csv(fixture, Some("fixture-1")).unwrap();
+        assert_eq!(report.record_count, 2);
+
+        let source = store.oui_source().unwrap().unwrap();
+        assert_eq!(source.version.as_deref(), Some("fixture-1"));
+        assert_eq!(source.record_count, 2);
+
+        let mac: crate::domain::MacAddress = "00:11:22:33:44:55".parse().unwrap();
+        let found = store.lookup_oui(mac).unwrap().unwrap();
+        assert_eq!(found.organization, "Example Sensors");
+        assert_eq!(found.prefix_bits, 36);
+
+        let entries = store.oui_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn locally_administered_mac_is_never_attributed() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .import_oui_csv(
+                "Registry,Assignment,Organization Name\nMA-L,001122,Example Networks\n",
+                Some("fixture-1"),
+            )
+            .unwrap();
+        let mac: crate::domain::MacAddress = "02:11:22:33:44:55".parse().unwrap();
+        assert!(store.lookup_oui(mac).unwrap().is_none());
+    }
 }

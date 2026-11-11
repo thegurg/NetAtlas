@@ -25,6 +25,6 @@ pub use network::{
     NetworkSegment, RouteInfo,
 };
 pub use observation::{
-    HostnameObservation, HostProbe, HostObservation, ObservationKind, ObservationRecord, Source,
+    HostObservation, HostProbe, HostnameObservation, ObservationKind, ObservationRecord, Source,
     SubjectType, TcpProbe, TcpProbeOutcome,
 };

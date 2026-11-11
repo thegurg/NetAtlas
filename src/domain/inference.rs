@@ -169,7 +169,10 @@ pub fn infer_property(
         };
         return InferenceRecord {
             id: crate::domain::ids::new_id(),
-            device_id: evidence.first().map(|item| item.device_id).unwrap_or_default(),
+            device_id: evidence
+                .first()
+                .map(|item| item.device_id)
+                .unwrap_or_default(),
             property,
             value: None,
             confidence: Confidence::Unknown,
@@ -183,7 +186,8 @@ pub fn infer_property(
 
     let mut groups: BTreeMap<String, Vec<&EvidenceRecord>> = BTreeMap::new();
     for item in &fresh {
-        let key = serde_json::to_string(&item.candidate).unwrap_or_else(|_| item.candidate.to_string());
+        let key =
+            serde_json::to_string(&item.candidate).unwrap_or_else(|_| item.candidate.to_string());
         groups.entry(key).or_default().push(item);
     }
 
@@ -228,7 +232,10 @@ pub fn infer_property(
     let Some((_, items)) = groups.into_iter().next() else {
         return InferenceRecord {
             id: crate::domain::ids::new_id(),
-            device_id: evidence.first().map(|item| item.device_id).unwrap_or_default(),
+            device_id: evidence
+                .first()
+                .map(|item| item.device_id)
+                .unwrap_or_default(),
             property,
             value: None,
             confidence: Confidence::Unknown,
@@ -272,6 +279,22 @@ pub fn infer_property(
     }
 }
 
+/// Aggregate evidence for a known device.
+///
+/// `infer_property` derives the device from the evidence, which cannot work
+/// when there is no evidence at all. Callers that always know the device should
+/// use this function so an `unknown` inference still references it.
+pub fn infer_property_for(
+    device_id: Uuid,
+    property: Property,
+    evidence: &[EvidenceRecord],
+    now_ms: i64,
+) -> InferenceRecord {
+    let mut record = infer_property(property, evidence, now_ms);
+    record.device_id = device_id;
+    record
+}
+
 fn display_candidate(candidate: &serde_json::Value) -> String {
     match candidate {
         serde_json::Value::String(value) => value.clone(),
@@ -287,7 +310,12 @@ mod tests {
     use super::{InferenceStatus, UnknownReason, infer_property};
     use crate::domain::{Confidence, EvidenceRecord, Property, Source};
 
-    fn evidence(candidate: &str, unit: &str, confidence: Confidence, expires_at_ms: Option<i64>) -> EvidenceRecord {
+    fn evidence(
+        candidate: &str,
+        unit: &str,
+        confidence: Confidence,
+        expires_at_ms: Option<i64>,
+    ) -> EvidenceRecord {
         EvidenceRecord {
             id: Uuid::now_v7(),
             observation_id: Uuid::now_v7(),
@@ -363,7 +391,12 @@ mod tests {
     fn expired_evidence_is_stale_unknown() {
         let record = infer_property(
             Property::Manufacturer,
-            &[evidence("Vendor A", "oui:1", Confidence::Medium, Some(1_500))],
+            &[evidence(
+                "Vendor A",
+                "oui:1",
+                Confidence::Medium,
+                Some(1_500),
+            )],
             2_000,
         );
         assert_eq!(record.status, InferenceStatus::Unknown);

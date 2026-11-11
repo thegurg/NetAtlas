@@ -982,7 +982,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "async-trait",
  "chrono",
  "clap",
  "csv",
@@ -995,7 +994,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "socket2",
  "surge-ping",
  "tempfile",
  "thiserror",

@@ -35,7 +35,9 @@ impl std::str::FromStr for Property {
             "category" => Ok(Self::Category),
             "os" => Ok(Self::Os),
             "model" => Ok(Self::Model),
-            other => Err(crate::domain::DomainError::InvalidProperty(other.to_string())),
+            other => Err(crate::domain::DomainError::InvalidProperty(
+                other.to_string(),
+            )),
         }
     }
 }

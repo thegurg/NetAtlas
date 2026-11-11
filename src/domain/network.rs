@@ -47,7 +47,10 @@ impl MacAddress {
         if !matches!(bits, 24 | 28 | 36) {
             return Err(DomainError::InvalidPrefixBits(bits));
         }
-        let full = format!("{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}", self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]);
+        let full = format!(
+            "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        );
         Ok(full[..(bits as usize / 4)].to_string())
     }
 }
@@ -80,7 +83,10 @@ impl FromStr for MacAddress {
             parts
                 .iter()
                 .map(|part| {
-                    if part.is_empty() || part.len() > 2 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if part.is_empty()
+                        || part.len() > 2
+                        || !part.chars().all(|c| c.is_ascii_hexdigit())
+                    {
                         Err(DomainError::InvalidMac(value.to_string()))
                     } else {
                         Ok(format!("{part:0>2}"))
@@ -89,7 +95,11 @@ impl FromStr for MacAddress {
                 .collect::<Result<Vec<_>, _>>()?
         } else if trimmed.contains('.') {
             let parts: Vec<&str> = trimmed.split('.').collect();
-            if parts.len() != 3 || parts.iter().any(|part| part.len() != 4 || !part.chars().all(|c| c.is_ascii_hexdigit())) {
+            if parts.len() != 3
+                || parts
+                    .iter()
+                    .any(|part| part.len() != 4 || !part.chars().all(|c| c.is_ascii_hexdigit()))
+            {
                 return Err(DomainError::InvalidMac(value.to_string()));
             }
             let joined = parts.concat();
@@ -148,7 +158,9 @@ pub struct InterfaceInfo {
 
 impl InterfaceInfo {
     pub fn ipv4_addresses(&self) -> impl Iterator<Item = &InterfaceAddress> {
-        self.addresses.iter().filter(|address| address.address.is_ipv4())
+        self.addresses
+            .iter()
+            .filter(|address| address.address.is_ipv4())
     }
 }
 
@@ -196,7 +208,12 @@ impl NeighborState {
     pub fn is_present(self) -> bool {
         matches!(
             self,
-            Self::Reachable | Self::Stale | Self::Delay | Self::Probe | Self::Permanent | Self::Noarp
+            Self::Reachable
+                | Self::Stale
+                | Self::Delay
+                | Self::Probe
+                | Self::Permanent
+                | Self::Noarp
         )
     }
 }
@@ -230,7 +247,9 @@ pub struct NetworkContext {
 
 impl NetworkContext {
     pub fn interface_by_name(&self, name: &str) -> Option<&InterfaceInfo> {
-        self.interfaces.iter().find(|interface| interface.name == name)
+        self.interfaces
+            .iter()
+            .find(|interface| interface.name == name)
     }
 
     pub fn local_ips(&self) -> Vec<IpAddr> {
@@ -242,10 +261,9 @@ impl NetworkContext {
 
     pub fn interface_for_ip(&self, ip: IpAddr) -> Option<&InterfaceInfo> {
         self.interfaces.iter().find(|interface| {
-            interface
-                .addresses
-                .iter()
-                .any(|address| prefix_for_address(address).is_some_and(|prefix| prefix.contains(&ip)))
+            interface.addresses.iter().any(|address| {
+                prefix_for_address(address).is_some_and(|prefix| prefix.contains(&ip))
+            })
         })
     }
 
@@ -354,9 +372,24 @@ mod tests {
 
     #[test]
     fn detects_local_and_multicast_bits() {
-        assert!("02:00:00:00:00:01".parse::<MacAddress>().unwrap().is_locally_administered());
-        assert!(!"00:11:22:33:44:55".parse::<MacAddress>().unwrap().is_locally_administered());
-        assert!("01:00:5e:00:00:01".parse::<MacAddress>().unwrap().is_multicast());
+        assert!(
+            "02:00:00:00:00:01"
+                .parse::<MacAddress>()
+                .unwrap()
+                .is_locally_administered()
+        );
+        assert!(
+            !"00:11:22:33:44:55"
+                .parse::<MacAddress>()
+                .unwrap()
+                .is_locally_administered()
+        );
+        assert!(
+            "01:00:5e:00:00:01"
+                .parse::<MacAddress>()
+                .unwrap()
+                .is_multicast()
+        );
     }
 
     #[test]
@@ -371,7 +404,10 @@ mod tests {
     fn enumerates_small_networks() {
         let net: Ipv4Net = "192.168.1.0/30".parse().unwrap();
         let hosts = enumerate_ipv4_hosts(net, &[], 100).unwrap();
-        assert_eq!(hosts, vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2)]);
+        assert_eq!(
+            hosts,
+            vec![Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(192, 168, 1, 2)]
+        );
     }
 
     #[test]

@@ -127,7 +127,10 @@ pub fn parse_csv(contents: &str) -> Result<OuiParseResult, OuiError> {
 }
 
 fn prefix_bits_for(prefix_hex: &str) -> Option<u8> {
-    if !prefix_hex.chars().all(|character| character.is_ascii_hexdigit()) {
+    if !prefix_hex
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+    {
         return None;
     }
     match prefix_hex.len() {
@@ -171,7 +174,7 @@ pub fn embedded_source_meta(record_count: usize) -> OuiSourceMeta {
 
 /// Longest-prefix OUI lookup. Callers must not use this for locally
 /// administered MAC addresses.
-pub fn lookup<'a>(entries: &'a [OuiEntry], mac: MacAddress) -> Option<&'a OuiEntry> {
+pub fn lookup(entries: &[OuiEntry], mac: MacAddress) -> Option<&OuiEntry> {
     for bits in [36_u8, 28, 24] {
         let prefix = mac.prefix_hex(bits).ok()?;
         if let Some(entry) = entries
@@ -185,7 +188,7 @@ pub fn lookup<'a>(entries: &'a [OuiEntry], mac: MacAddress) -> Option<&'a OuiEnt
 }
 
 /// Lookup that refuses locally administered addresses.
-pub fn lookup_global<'a>(entries: &'a [OuiEntry], mac: MacAddress) -> Option<&'a OuiEntry> {
+pub fn lookup_global(entries: &[OuiEntry], mac: MacAddress) -> Option<&OuiEntry> {
     if mac.is_locally_administered() {
         None
     } else {

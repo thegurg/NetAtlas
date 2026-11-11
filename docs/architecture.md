@@ -1,6 +1,7 @@
 # NetAtlas architecture
 
-Status: Phase 0 design. Nothing in this document is implemented yet.
+Status: Phase 1 implemented (shared core and discovery). Later-phase modules are
+described where they affect the current boundaries, but they do not exist yet.
 
 ## 1. Goals and non-goals
 
@@ -55,66 +56,57 @@ Status: Phase 0 design. Nothing in this document is implemented yet.
 
 Rules:
 
-- `domain` depends only on `std`, `serde`, `ipnet`, `macaddr`, `chrono`, `uuid`,
+- `domain` depends only on `std`, `serde`, `serde_json`, `ipnet`, `chrono`, `uuid`,
   `thiserror`. No sockets, no SQLite, no terminal, no async runtime.
-- `application` depends on `domain` and on narrow port traits for I/O. It never opens
-  a socket or writes SQL directly.
-- `infrastructure` implements those ports. Protocol parsers are separate from socket
-  operations so they can be tested from fixtures.
-- `cli` and `tui` depend on application services and domain types. Neither contains
-  discovery, protocol, fingerprinting, or database logic.
+- `application` depends on `domain` and on concrete infrastructure adapters in Phase 1.
+  It orchestrates I/O but contains no socket setup and no SQL. A port trait layer will be
+  introduced when more providers need uniform scheduling.
+- `infrastructure` contains the adapters. Protocol parsing is separated from socket
+  operations so it can be tested from fixtures (OUI parsing is the current example).
+- `cli` depends on application services and domain types. It contains no discovery,
+  protocol, fingerprinting, or database logic.
 - Dependencies point inward. `domain` never imports an adapter.
 
-## 3. Planned module map
+## 3. Implemented module map
 
 ```
 src/
-  main.rs                 binary entry point, runtime setup, exit-code mapping
+  main.rs                 binary entry point, tracing setup, exit code
   lib.rs                  public crate surface for integration tests
   config/                 XDG paths, config.toml, defaults, validation
   domain/
-    ids.rs                typed IDs (DeviceId, SessionId, ...)
-    time.rs               UTC millisecond timestamps
-    network.rs            interface, address, segment, gateway
-    device.rs             device profile and identifiers
-    observation.rs        observed facts and measurements
-    evidence.rs           evidence, source units, independence keys
-    inference.rs          candidate conclusions and conflicts
+    ids.rs                UUIDv7 identifier creation
+    time.rs               UTC millisecond timestamps and formatting
+    network.rs            MAC, interface, address, segment, gateway, host enumeration
+    device.rs             devices, identifiers, identity links, presentation views
+    observation.rs        observed facts, host probes, normalized host observations
+    evidence.rs           evidence, properties, source units
+    inference.rs          candidate conclusions, conflicts, unknown reasons
     confidence.rs         confidence enum and aggregation rubric
-    service.rs            service observations
-    dns.rs                DNS records, measurements, validation state
-    route.rs              route measurements and hops
-    event.rs              derived change events
     error.rs              domain errors
   application/
-    ports.rs              provider, resolver, probe, clock ports
-    context.rs            gather local network context
-    discovery.rs          orchestrate providers into one session
-    identify.rs           run inference over observations
-    inventory.rs          device/segment queries and history
-    dns.rs                query/compare use cases (later)
-    route.rs              trace/compare use cases (later)
-    monitor.rs            change detection (later)
-    export.rs             import/export (later)
+    model.rs              scan/session result types
+    discovery.rs          scope resolution, provider scheduling, persistence
+    identity.rs           identity resolution v1
+    identify.rs           evidence extraction and inference
   infrastructure/
-    netlink/              links, addresses, routes, neighbour table
-    icmp/                 ICMP echo provider (surge-ping)
-    probe/                bounded TCP connect probes
-    mdns/                 mDNS browse/resolve adapter
-    ssdp/                 SSDP discovery + description fetch
-    netbios/              NBSTAT query + parser
-    service/              safe protocol-specific banner collection
-    oui/                  IEEE registry loader and lookup
-    dns/                  hickory transport and DNSSEC validation
-    route/                ICMP/UDP/TCP traceroute probes
+    netlink.rs            links, addresses, routes, neighbour table
+    icmp.rs               ICMP echo provider (surge-ping)
+    tcp_probe.rs          bounded TCP connect fallback
+    reverse_dns.rs        PTR lookup through hickory
+    oui.rs                IEEE registry parser, embedded snapshot, lookup
     storage/              SQLite store, migrations, repositories
   cli/                    clap definitions, handlers, table/JSON output
-  tui/                    ratatui state and views
 ```
+
+Planned later modules: `application/inventory.rs`, `application/dns.rs`,
+`application/route.rs`, `application/monitor.rs`, `application/export.rs`,
+`infrastructure/{mdns,ssdp,netbios,service}/`, and `tui/`. They are not created as
+empty placeholders.
 
 Feature modules (`discovery`, `identification`, `lan`, `dns`, `route`, `monitoring`)
 are realized as application services plus infrastructure adapters, not as separate
-applications. Names may evolve during implementation; the layer boundaries may not.
+applications. Names may evolve; the layer boundaries may not.
 
 ## 4. Data flow
 
@@ -158,49 +150,49 @@ DNS and route measurements follow the same shape: a measurement is recorded with
 method, target, resolver/probe parameters, timing, and result. Comparison is a pure
 domain operation over stored measurements.
 
-## 5. Provider contract
+## 5. Provider contract in Phase 1
 
-Each discovery provider implements one port:
+Phase 1 uses concrete adapters with narrow async functions rather than a dyn-compatible
+trait:
 
 ```rust
-#[async_trait]
-pub trait DiscoveryProvider: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn methods(&self) -> &'static [DiscoveryMethod];
-
-    async fn run(
-        &self,
-        context: &ScanContext,
-        sink: &ObservationSink,
-        cancel: &CancellationToken,
-    ) -> ProviderReport;
-}
+icmp::sweep(&addresses, timeout, concurrency, &cancel).await
+tcp_probe::probe_hosts(&addresses, ports, timeout, concurrency, &cancel).await
+reverse_dns::lookup(&addresses, timeout, concurrency, &cancel).await
+netlink::snapshot().await
 ```
 
-- `ObservationSink` is a bounded channel sender. Providers emit observations as they
-  are made; they do not accumulate an unbounded result set.
-- `ProviderReport` contains counts, duration, and typed errors. A provider failure is
-  recorded in the session and does not cancel other providers.
-- `ScanContext` carries the explicit interface/target scope, timeouts, concurrency
-  limit, and rate limit. Providers must not invent their own scope.
-- `CancellationToken` is checked between probe batches and used to abort in-flight
-  sockets.
+The orchestrator, not the adapter, decides scope and builds `HostProbe` values. Each
+adapter returns typed results and errors:
 
-Fake providers in tests implement the same trait and emit fixture observations.
+- A provider failure is recorded in `ProviderReport` and does not cancel other
+  providers. The session becomes `partial`.
+- `ScanOptions` carries the explicit interface/target scope, timeouts, concurrency
+  limit, and `max_hosts`. Adapters must not invent their own scope.
+- `CancellationToken` is checked before each probe; in-flight probes are bounded by the
+  per-operation timeout.
+
+A provider trait will be introduced when Phase 2 adds mDNS, SSDP, NetBIOS, and service
+probes and the orchestration needs uniform scheduling. Test doubles can then implement
+that trait; today the pure aggregation and identity functions are tested directly from
+fixture observations.
 
 ## 6. Concurrency and cancellation
 
-- Tokio multi-thread runtime. Blocking work (SQLite writes) runs on a dedicated
-  blocking thread or is serialized in one writer task; it never blocks the async
-  workers or the TUI render loop.
-- Every scan has a `JoinSet` of provider tasks and a global `Semaphore` for network
-  operations. Default network concurrency is 64, configurable. No unbounded spawning.
-- Per-provider timeout and per-operation timeout are separate. A slow provider cannot
-  extend the whole scan indefinitely.
-- `Ctrl-C` (CLI) or a cancel action (TUI) triggers the cancellation token; the session
-  is finalized as `cancelled` with whatever observations were already recorded.
-- Progress is reported through a bounded event channel (`SessionEvent`), consumed by
-  the CLI progress renderer or the TUI. The TUI never performs network I/O itself.
+- Tokio multi-thread runtime. SQLite writes happen synchronously after network work, on
+  the scan task, inside one transaction. The current CLI has no render loop to block; a
+  future TUI will move persistence to a dedicated writer task.
+- Probes use `futures_util::buffer_unordered` with the configured concurrency (default
+  64). There is no unbounded spawning. `max_hosts` bounds the candidate set before any
+  probe is sent.
+- Per-operation timeouts are explicit (`--timeout-ms`, `--dns-timeout-ms`). There is no
+  separate whole-provider deadline yet; the candidate and concurrency bounds keep the
+  total work finite.
+- `Ctrl-C` (CLI) triggers a `CancellationToken`. The session is finalized as
+  `cancelled` with whatever observations were already recorded. The CLI exits with code
+  3 because the result is incomplete.
+- Progress is not streamed yet. The CLI prints a final report. Phase 7 will add a
+  bounded event channel for the TUI.
 
 ## 7. Error model and exit codes
 
@@ -217,13 +209,13 @@ CLI exit codes:
 | Code | Meaning |
 | --- | --- |
 | 0 | Operation completed. Zero discovered hosts is still a completed result. |
-| 1 | Operational failure (database, configuration, unrecoverable I/O). |
-| 2 | Invalid usage (clap default). |
-| 3 | Partial result: at least one requested method failed, results are incomplete. |
-| 4 | Requested object not found (device, session, measurement). |
+| 1 | Operational failure (database, configuration, netlink, unrecoverable I/O). |
+| 2 | Invalid usage: clap errors, invalid target syntax, MAC, UUID, or scan limits. |
+| 3 | Partial or cancelled result: at least one requested method failed, or Ctrl-C interrupted the scan. |
+| 4 | Requested object not found (device). An OUI miss is a normal result and exits 0. |
 
-`--json` output always includes a `status` field and any provider errors, so automation
-can distinguish complete from partial results.
+`--json` output always includes `schema_version` and the session `status`, and provider
+reports carry typed errors, so automation can distinguish complete from partial results.
 
 ## 8. Permission model
 
@@ -241,15 +233,19 @@ can distinguish complete from partial results.
 
 ## 9. Storage boundary
 
-- Application services call repository methods; they do not execute SQL.
+- Application services call `Store` methods; the CLI does not execute SQL.
 - SQLite runs with foreign keys enabled, WAL journaling, and explicit transactions.
-- Schema changes are versioned migrations applied in order, recorded in
-  `schema_migrations` and guarded by `PRAGMA user_version`.
-- Observation history is append-oriented. Current device profiles are derived, not
-  overwritten.
-- A scan writes its session, observations, evidence, and inferences in bounded
-  transaction batches; a crash leaves a `running` session that can be finalized as
-  `interrupted` on next startup rather than corrupting prior history.
+- Schema changes are versioned SQL migrations applied in order, recorded in
+  `schema_migrations` and guarded by `PRAGMA user_version`. A newer database version is
+  rejected rather than opened.
+- Observation history is append-oriented. Current device profiles are derived from
+  identifiers and the latest inference per property.
+- One scan writes its session, devices, identifiers, observations, evidence,
+  inferences, and identity links in one transaction. A failure rolls the whole scan
+  back. A crash can leave a `running` session; finalizing it as `interrupted` on next
+  startup is not implemented yet.
+- `Store::open` imports the embedded OUI snapshot on first use. `Store::open_in_memory`
+  is used by tests and does not import it automatically.
 
 ## 10. Decision log
 
@@ -348,6 +344,40 @@ Resolve `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME` (falling back to `~/.config` and
 `~/.local/share`) in `config/`. This is a few lines and avoids a dependency whose
 platform matrix NetAtlas does not use.
 
+### D13 — Custom `MacAddress` instead of a crate
+
+The domain owns a 48-bit `MacAddress` with parsing for colon, hyphen, Cisco dotted, and
+plain hex forms, plus explicit local-admin and multicast checks. This keeps the
+local-admin rule visible at the type boundary and avoids a dependency whose API and
+license would need separate review.
+
+### D14 — Direct provider adapters in Phase 1
+
+Phase 1 has three active probe families and no third-party provider plugins. Direct
+async functions keep scheduling, cancellation, and error mapping in one readable
+orchestrator. The planned `DiscoveryProvider` trait is deferred until Phase 2 adds more
+providers and test doubles genuinely benefit from uniform dispatch.
+
+### D15 — Neighbour table re-read after active probes
+
+The kernel owns ARP/NDP state. After ICMP and TCP probes, the orchestrator reads the
+neighbour table again and merges new entries. This yields MACs for hosts that answered
+without hand-crafting ARP frames. Duplicate entries are deduplicated by address, MAC, and
+state.
+
+### D16 — One SQLite source per OUI import, latest wins
+
+An OUI import is a new `oui_sources` row with its own hash and record set. Lookups use
+the most recent source (ordered by import time and UUIDv7 ID). Old sources remain for
+provenance instead of being destructively replaced. `oui_entries` loads only the latest
+source for in-memory lookup.
+
+### D17 — SQLite writes stay on the scan task for now
+
+The Phase 1 CLI has no render loop, so one transaction at the end of a scan is simpler
+and safer than a writer task. When the TUI arrives, persistence will move behind a
+writer task or a blocking pool so rendering is never blocked.
+
 ## 11. Known limitations to design around
 
 - Wi-Fi client isolation, hotspot mode, VLANs, firewalls, and multicast filtering can
@@ -355,14 +385,24 @@ platform matrix NetAtlas does not use.
 - Mobile devices sleep, randomize MACs, and expose little metadata.
 - OUI data maps address blocks, not devices. Virtual machines and hypervisors use
   locally administered addresses.
+- Phase 1 cannot merge a locally administered MAC on its own, so privacy-randomized
+  clients and many virtual machines create a new logical device per scan plus an
+  uncertain link. This is intentional until stronger identifiers exist.
+- A host seen only through ICMP, with no MAC, also creates a new logical device per scan
+  because IP alone never merges.
 - Hostnames are claims, not verified identities.
 - Service banners and UPnP/mDNS descriptions are self-reported and can be stale or
   misleading.
 - Exact phone/PC model identification is usually impossible from LAN observations.
 - Netlink neighbour entries do not carry a kernel timestamp; `observed_at` records when
   NetAtlas read the entry, and the neighbour state (`REACHABLE`, `STALE`, ...) is kept.
-- The local resolver may cache answers; DNS diagnostics must record the resolver and
-  cannot claim authoritative freshness.
+- The local resolver may cache answers; reverse DNS is a naming hint, not a verified
+  identity. DNS diagnostics must record the resolver and cannot claim authoritative
+  freshness.
+- Phase 1 has no mDNS, SSDP, NetBIOS, or service banners, so category/OS/model have no
+  possible evidence and are always `unknown` with a reason.
+- A provider failure makes the session `partial`; it does not imply that the failed
+  method found nothing.
 
 ## 12. Security and safety posture
 

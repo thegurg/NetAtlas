@@ -36,7 +36,8 @@ pub enum NetlinkError {
 
 /// Read the current network context.
 pub async fn snapshot() -> Result<NetworkContext, NetlinkError> {
-    let (connection, handle, _) = new_connection().map_err(|error| NetlinkError::Connect(error.to_string()))?;
+    let (connection, handle, _) =
+        new_connection().map_err(|error| NetlinkError::Connect(error.to_string()))?;
     tokio::spawn(connection);
 
     let links = dump_links(&handle).await?;
@@ -122,7 +123,10 @@ pub async fn snapshot() -> Result<NetworkContext, NetlinkError> {
                 .find(|interface| {
                     interface.is_up
                         && !interface.is_loopback
-                        && interface.addresses.iter().any(|address| address.family == 4)
+                        && interface
+                            .addresses
+                            .iter()
+                            .any(|address| address.family == 4)
                 })
                 .map(|interface| interface.name.clone())
         });
@@ -219,38 +223,53 @@ async fn dump_neighbors(handle: &Handle) -> Result<Vec<NeighbourMessage>, Netlin
 }
 
 fn link_name(message: &LinkMessage) -> Option<String> {
-    message.attributes.iter().find_map(|attribute| match attribute {
-        LinkAttribute::IfName(name) => Some(name.clone()),
-        _ => None,
-    })
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::IfName(name) => Some(name.clone()),
+            _ => None,
+        })
 }
 
 fn link_mac(message: &LinkMessage) -> Option<MacAddress> {
-    message.attributes.iter().find_map(|attribute| match attribute {
-        LinkAttribute::Address(bytes) => MacAddress::from_bytes(bytes),
-        _ => None,
-    })
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::Address(bytes) => MacAddress::from_bytes(bytes),
+            _ => None,
+        })
 }
 
 fn link_mtu(message: &LinkMessage) -> Option<u32> {
-    message.attributes.iter().find_map(|attribute| match attribute {
-        LinkAttribute::Mtu(mtu) => Some(*mtu),
-        _ => None,
-    })
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::Mtu(mtu) => Some(*mtu),
+            _ => None,
+        })
 }
 
 fn link_oper_state(message: &LinkMessage) -> Option<String> {
-    message.attributes.iter().find_map(|attribute| match attribute {
-        LinkAttribute::OperState(state) => Some(format!("{state:?}").to_lowercase()),
-        _ => None,
-    })
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::OperState(state) => Some(format!("{state:?}").to_lowercase()),
+            _ => None,
+        })
 }
 
 fn address_ip(message: &AddressMessage) -> Option<IpAddr> {
-    message.attributes.iter().find_map(|attribute| match attribute {
-        AddressAttribute::Address(ip) => Some(*ip),
-        _ => None,
-    })
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            AddressAttribute::Address(ip) => Some(*ip),
+            _ => None,
+        })
 }
 
 fn parse_route(message: &RouteMessage, index_to_name: &HashMap<u32, String>) -> RouteInfo {
