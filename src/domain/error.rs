@@ -26,6 +26,8 @@ pub enum DomainError {
     InvalidUnknownReason(String),
     #[error("invalid link status: {0}")]
     InvalidLinkStatus(String),
+    #[error("invalid transport: {0}")]
+    InvalidTransport(String),
     #[error("invalid MAC prefix length {0}; expected 24, 28, or 36 bits")]
     InvalidPrefixBits(u8),
     #[error("IP prefix {0} is too large to enumerate safely")]

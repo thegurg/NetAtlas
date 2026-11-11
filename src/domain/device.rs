@@ -172,4 +172,5 @@ pub struct DeviceDetail {
     pub observations: Vec<ObservationRecord>,
     pub inferences: Vec<crate::domain::InferenceRecord>,
     pub links: Vec<IdentityLink>,
+    pub services: Vec<crate::domain::ServiceRecord>,
 }

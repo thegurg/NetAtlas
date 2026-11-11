@@ -10,6 +10,7 @@ pub mod ids;
 pub mod inference;
 pub mod network;
 pub mod observation;
+pub mod service;
 pub mod time;
 
 pub use confidence::Confidence;
@@ -25,6 +26,8 @@ pub use network::{
     NetworkSegment, RouteInfo,
 };
 pub use observation::{
-    HostObservation, HostProbe, HostnameObservation, ObservationKind, ObservationRecord, Source,
-    SubjectType, TcpProbe, TcpProbeOutcome,
+    HostObservation, HostProbe, HostnameObservation, MdnsServiceObservation, NetbiosObservation,
+    ObservationKind, ObservationRecord, ProtocolObservation, ServiceObservation, Source,
+    SubjectType, TcpProbe, TcpProbeOutcome, UpnpObservation,
 };
+pub use service::{ServiceRecord, Transport};

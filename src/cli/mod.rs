@@ -95,6 +95,21 @@ struct DiscoverArgs {
     /// Disable reverse DNS.
     #[arg(long)]
     no_dns: bool,
+    /// Disable mDNS/DNS-SD browsing.
+    #[arg(long)]
+    no_mdns: bool,
+    /// Disable SSDP/UPnP discovery.
+    #[arg(long)]
+    no_ssdp: bool,
+    /// Disable NetBIOS name queries.
+    #[arg(long)]
+    no_netbios: bool,
+    /// Disable safe TCP service banner probes.
+    #[arg(long)]
+    no_services: bool,
+    /// mDNS browse window in milliseconds.
+    #[arg(long, value_name = "MS")]
+    mdns_window_ms: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,9 +179,16 @@ async fn execute(cli: Cli) -> Result<i32> {
             if let Some(max_hosts) = args.max_hosts {
                 options.max_hosts = max_hosts;
             }
+            if let Some(window) = args.mdns_window_ms {
+                options.mdns_window_ms = window;
+            }
             options.enable_icmp = !args.no_icmp;
             options.enable_tcp = !args.no_tcp;
             options.enable_dns = !args.no_dns;
+            options.enable_mdns = !args.no_mdns;
+            options.enable_ssdp = !args.no_ssdp;
+            options.enable_netbios = !args.no_netbios;
+            options.enable_services = !args.no_services;
 
             if let Err(error) = options.validate() {
                 eprintln!("error: {error}");
@@ -445,6 +467,11 @@ fn print_scan(scan: &ScanResult) {
         println!("\nNo hosts were observed. This is not proof that the segment is empty.");
     }
 
+    if !scan.services.is_empty() {
+        println!("\nServices:");
+        print_services(&scan.services);
+    }
+
     for warning in &scan.context.warnings {
         println!("warning: {warning}");
     }
@@ -473,6 +500,8 @@ fn print_scan_devices(scan: &ScanResult) {
             .find_map(|host| host.hostname.as_ref().map(|name| name.name.clone()))
             .unwrap_or_else(|| "-".to_string());
         let manufacturer = inference_value(&inferences, device.id, Property::Manufacturer);
+        let category = inference_value(&inferences, device.id, Property::Category);
+        let model = inference_value(&inferences, device.id, Property::Model);
         rows.push(vec![
             short_id(device.id),
             ips,
@@ -482,6 +511,8 @@ fn print_scan_devices(scan: &ScanResult) {
                 macs
             },
             manufacturer,
+            category,
+            model,
             hostname,
             if device.is_new { "new" } else { "known" }.to_string(),
         ]);
@@ -492,8 +523,39 @@ fn print_scan_devices(scan: &ScanResult) {
             "ADDRESSES",
             "MACS",
             "MANUFACTURER",
+            "CATEGORY",
+            "MODEL",
             "HOSTNAME",
             "STATUS",
+        ],
+        rows,
+    );
+}
+
+fn print_services(services: &[crate::domain::ServiceRecord]) {
+    let mut rows = Vec::new();
+    for service in services {
+        rows.push(vec![
+            short_id(service.device_id),
+            service.ip.to_string(),
+            service.port.to_string(),
+            service.transport.as_str().to_string(),
+            service.protocol.clone().unwrap_or_else(|| "-".to_string()),
+            service.product.clone().unwrap_or_else(|| "-".to_string()),
+            service.version.clone().unwrap_or_else(|| "-".to_string()),
+            service.source.as_str().to_string(),
+        ]);
+    }
+    print_table(
+        &[
+            "DEVICE",
+            "ADDRESS",
+            "PORT",
+            "TRANSPORT",
+            "PROTOCOL",
+            "PRODUCT",
+            "VERSION",
+            "SOURCE",
         ],
         rows,
     );
@@ -620,6 +682,11 @@ fn print_device(detail: &DeviceDetail) {
             ],
             rows,
         );
+    }
+
+    if !detail.services.is_empty() {
+        println!("\nServices:");
+        print_services(&detail.services);
     }
 
     if !detail.links.is_empty() {

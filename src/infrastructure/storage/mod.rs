@@ -15,7 +15,7 @@ use crate::application::model::{ExistingDevice, ScanResult};
 use crate::domain::{
     Confidence, DeviceDetail, DeviceSummary, EvidenceRecord, IdentifierKind, IdentifierRecord,
     IdentityLink, InferenceRecord, InferenceStatus, InferenceView, MacAddress, ObservationRecord,
-    UnknownReason, ids::new_id, time::now_ms,
+    ServiceRecord, UnknownReason, ids::new_id, time::now_ms,
 };
 use crate::infrastructure::oui::{self, OuiEntry, OuiError, OuiParseResult, OuiSourceMeta};
 
@@ -267,7 +267,7 @@ impl Store {
     ) -> Result<Vec<ExistingDevice>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT d.id, d.label, d.first_seen_ms, d.last_seen_ms,
-                    i.kind, i.value, i.last_seen_ms
+                    i.kind, i.value, i.normalized, i.last_seen_ms
              FROM devices d
              LEFT JOIN device_identifiers i ON i.device_id = d.id
              WHERE d.merged_into IS NULL
@@ -288,6 +288,8 @@ impl Store {
                 macs: Vec::new(),
                 ips: Vec::new(),
                 hostnames: Vec::new(),
+                upnp_udns: Vec::new(),
+                mdns_instances: Vec::new(),
             });
 
             let Some(kind) = row.get::<_, Option<String>>(4)? else {
@@ -296,7 +298,10 @@ impl Store {
             let Some(value) = row.get::<_, Option<String>>(5)? else {
                 continue;
             };
-            let Some(identifier_last_seen) = row.get::<_, Option<i64>>(6)? else {
+            let Some(normalized) = row.get::<_, Option<String>>(6)? else {
+                continue;
+            };
+            let Some(identifier_last_seen) = row.get::<_, Option<i64>>(7)? else {
                 continue;
             };
 
@@ -314,7 +319,15 @@ impl Store {
                     }
                 }
                 "hostname" | "dns_name" => {
-                    entry.hostnames.push((value, identifier_last_seen));
+                    entry.hostnames.push((normalized, identifier_last_seen));
+                }
+                "upnp_udn" => {
+                    entry.upnp_udns.push((normalized, identifier_last_seen));
+                }
+                "mdns_instance" => {
+                    entry
+                        .mdns_instances
+                        .push((normalized, identifier_last_seen));
                 }
                 _ => {}
             }
@@ -349,6 +362,9 @@ impl Store {
 
         for observation in &scan.observations {
             Self::insert_observation(&transaction, observation)?;
+        }
+        for service in &scan.services {
+            Self::insert_service(&transaction, service)?;
         }
         for evidence in &scan.evidence {
             Self::insert_evidence(&transaction, evidence)?;
@@ -596,6 +612,33 @@ impl Store {
                 observation.observed_at_ms,
                 observation.expires_at_ms,
                 json_string(&observation.details)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_service(
+        transaction: &Transaction<'_>,
+        service: &ServiceRecord,
+    ) -> Result<(), StorageError> {
+        transaction.execute(
+            "INSERT OR IGNORE INTO services
+             (id, device_id, ip, port, transport, protocol, product, version,
+              banner, tls_json, source, observed_at_ms, details_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)",
+            params![
+                service.id.to_string(),
+                service.device_id.to_string(),
+                service.ip.to_string(),
+                service.port as i64,
+                service.transport.as_str(),
+                service.protocol,
+                service.product,
+                service.version,
+                service.banner,
+                service.source.as_str(),
+                service.observed_at_ms,
+                json_string(&service.details)
             ],
         )?;
         Ok(())
@@ -884,6 +927,7 @@ impl Store {
         let observations = self.load_observations(&device_id)?;
         let inferences = self.load_inferences(&device_id)?;
         let links = self.load_links(&device_id)?;
+        let services = self.load_services(&device_id)?;
 
         Ok(Some(DeviceDetail {
             summary,
@@ -892,6 +936,7 @@ impl Store {
             observations,
             inferences,
             links,
+            services,
         }))
     }
 
@@ -1028,6 +1073,48 @@ impl Store {
         Ok(inferences)
     }
 
+    fn load_services(&self, device_id: &str) -> Result<Vec<ServiceRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, device_id, ip, port, transport, protocol, product, version,
+                    banner, source, observed_at_ms, details_json
+             FROM services WHERE device_id = ?1
+             ORDER BY observed_at_ms DESC, port ASC",
+        )?;
+        let rows = statement.query_map(params![device_id], |row| {
+            Ok(ServiceRecord {
+                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                device_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_default(),
+                ip: row.get::<_, String>(2)?.parse().map_err(
+                    |error: std::net::AddrParseError| {
+                        rusqlite::Error::InvalidParameterName(error.to_string())
+                    },
+                )?,
+                port: row.get::<_, i64>(3)? as u16,
+                transport: row.get::<_, String>(4)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
+                        rusqlite::Error::InvalidParameterName(error.to_string())
+                    },
+                )?,
+                protocol: row.get(5)?,
+                product: row.get(6)?,
+                version: row.get(7)?,
+                banner: row.get(8)?,
+                source: row.get::<_, String>(9)?.parse().map_err(
+                    |error: crate::domain::DomainError| {
+                        rusqlite::Error::InvalidParameterName(error.to_string())
+                    },
+                )?,
+                observed_at_ms: row.get(10)?,
+                details: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or(Value::Null),
+            })
+        })?;
+        let mut services = Vec::new();
+        for row in rows {
+            services.push(row?);
+        }
+        Ok(services)
+    }
+
     fn load_links(&self, device_id: &str) -> Result<Vec<IdentityLink>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, from_device_id, to_device_id, basis, confidence, status,
@@ -1095,8 +1182,8 @@ mod tests {
         DiscoveryMethod, ScanConfig, ScanResult, ScanScope, SessionStatus,
     };
     use crate::domain::{
-        HostObservation, HostProbe, IdentifierKind, InferenceStatus, NetworkContext, Source,
-        ids::new_id,
+        Confidence, HostObservation, HostProbe, IdentifierKind, IdentifierRecord, InferenceStatus,
+        NetworkContext, ServiceRecord, Source, Transport, ids::new_id,
     };
 
     fn sample_scan() -> ScanResult {
@@ -1125,7 +1212,14 @@ mod tests {
             now,
             identity::DEFAULT_MAC_WINDOW_MS,
         );
-        let identification = identify::identify(session_id, &resolved.devices, &[], "test", now);
+        let identification = identify::identify(
+            session_id,
+            &resolved.devices,
+            &[],
+            "test",
+            &identify::ProviderAvailability::default(),
+            now,
+        );
         ScanResult {
             session_id,
             started_at_ms: now,
@@ -1140,8 +1234,10 @@ mod tests {
             config: ScanConfig {
                 timeout_ms: 1_000,
                 dns_timeout_ms: 1_500,
+                mdns_window_ms: 3_000,
                 concurrency: 4,
                 max_hosts: 1_024,
+                service_ports: vec![22, 80],
                 methods: vec![DiscoveryMethod::Neighbor],
             },
             context: NetworkContext {
@@ -1155,6 +1251,7 @@ mod tests {
             },
             hosts: vec![host],
             devices: resolved.devices,
+            services: Vec::new(),
             observations: identification.observations,
             evidence: identification.evidence,
             inferences: identification.inferences,
@@ -1196,6 +1293,86 @@ mod tests {
         assert_eq!(detail.inferences.len(), 4);
         assert!(!detail.observations.is_empty());
         assert_eq!(detail.summary.last_session_id, Some(scan.session_id));
+    }
+
+    #[test]
+    fn services_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut scan = sample_scan();
+        let device_id = scan.devices[0].id;
+        scan.services.push(ServiceRecord {
+            id: new_id(),
+            device_id,
+            ip: "192.168.1.10".parse().unwrap(),
+            port: 22,
+            transport: Transport::Tcp,
+            protocol: Some("ssh".to_string()),
+            product: Some("OpenSSH".to_string()),
+            version: Some("9.6".to_string()),
+            banner: Some("SSH-2.0-OpenSSH_9.6".to_string()),
+            source: Source::ServiceBanner,
+            observed_at_ms: 1_000,
+            details: serde_json::json!({ "os_hint": "Ubuntu" }),
+        });
+        store.save_scan(&scan).unwrap();
+
+        let detail = store.get_device(device_id).unwrap().unwrap();
+        assert_eq!(detail.services.len(), 1);
+        let service = &detail.services[0];
+        assert_eq!(service.port, 22);
+        assert_eq!(service.transport, Transport::Tcp);
+        assert_eq!(service.protocol.as_deref(), Some("ssh"));
+        assert_eq!(service.product.as_deref(), Some("OpenSSH"));
+        assert_eq!(service.source, Source::ServiceBanner);
+        assert_eq!(service.details["os_hint"], "Ubuntu");
+    }
+
+    #[test]
+    fn strong_identifiers_are_loaded_for_linking() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut scan = sample_scan();
+        let device = &mut scan.devices[0];
+        let device_id = device.id;
+        device.identifiers.push(IdentifierRecord {
+            id: new_id(),
+            device_id,
+            kind: IdentifierKind::UpnpUdn,
+            value: "uuid:1234".to_string(),
+            normalized: "1234".to_string(),
+            source: Source::Ssdp,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            confidence: Confidence::High,
+            details: serde_json::json!({}),
+        });
+        device.identifiers.push(IdentifierRecord {
+            id: new_id(),
+            device_id,
+            kind: IdentifierKind::MdnsInstance,
+            value: "Living Room._airplay._tcp.local.".to_string(),
+            normalized: "living room._airplay._tcp.local.".to_string(),
+            source: Source::Mdns,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            confidence: Confidence::Medium,
+            details: serde_json::json!({}),
+        });
+        store.save_scan(&scan).unwrap();
+
+        let existing = store
+            .load_existing_devices(1_000, identity::DEFAULT_MAC_WINDOW_MS)
+            .unwrap();
+        let loaded = existing
+            .iter()
+            .find(|device| device.id == device_id)
+            .unwrap();
+        assert!(loaded.upnp_udns.iter().any(|(value, _)| value == "1234"));
+        assert!(
+            loaded
+                .mdns_instances
+                .iter()
+                .any(|(value, _)| value == "living room._airplay._tcp.local.")
+        );
     }
 
     #[test]

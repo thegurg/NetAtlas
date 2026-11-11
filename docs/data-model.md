@@ -1,7 +1,8 @@
 # NetAtlas data model
 
-Status: Phase 1. Migration `0001_discovery` is implemented and applied automatically.
-Later DNS, route, and monitoring tables do not exist yet.
+Status: Phase 2. Migration `0001_discovery` is implemented and applied automatically.
+Phase 2 uses the existing `services` table; no new migration was required. Later DNS,
+route, and monitoring tables do not exist yet.
 
 ## 1. Modeling principles
 
@@ -111,7 +112,35 @@ pub struct Inference {
     pub unknown_reason: Option<UnknownReason>,
     pub computed_at_ms: i64,
 }
+
+pub enum Transport { Tcp, Udp }
+
+pub struct ServiceRecord {
+    pub id: Uuid,
+    pub device_id: DeviceId,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub transport: Transport,
+    pub protocol: Option<String>,
+    pub product: Option<String>,
+    pub version: Option<String>,
+    pub banner: Option<String>,
+    pub source: Source,
+    pub observed_at_ms: i64,
+    pub details: serde_json::Value,
+}
+
+pub enum ProtocolObservation {
+    Mdns(MdnsServiceObservation),
+    Upnp(UpnpObservation),
+    Netbios(NetbiosObservation),
+    Service(ServiceObservation),
+}
 ```
+
+A `HostProbe` carries an optional `protocol` payload. mDNS, UPnP, NetBIOS, and service
+observations therefore flow through the same normalized observation stream as ICMP, TCP,
+neighbour, and reverse-DNS facts.
 
 `Source` is a typed enum plus detail, not a free-form string:
 
@@ -131,9 +160,10 @@ pub enum Source {
 }
 ```
 
-Phase 1 emits only `Ip`, `Mac`, and `DnsName` identifiers and the sources
-`NeighborTable`, `IcmpEcho`, `TcpProbe`, `ReverseDns`, and `OuiRegistry`. The other
-variants are reserved for the protocols described in later phases.
+Phase 2 emits `Ip`, `Mac`, `DnsName`, `NetbiosName`, `MdnsInstance`, and `UpnpUdn`
+identifiers and the sources `NeighborTable`, `IcmpEcho`, `TcpProbe`, `ReverseDns`,
+`Mdns`, `Ssdp`, `Netbios`, `ServiceBanner`, and `OuiRegistry`. `SshHostKey` and
+`TlsCertificate` are reserved for later phases.
 
 ## 3. Identity model
 
@@ -146,32 +176,40 @@ duplicate hostnames), so `(kind, normalized)` is not unique. Queries select by
 
 ### 3.2 Linking rules
 
-Phase 1 implements a deliberately conservative subset. When a host observation is
+Phase 2 implements a deliberately conservative subset. When a host observation is
 resolved, the rules are applied in this order:
 
-1. **Same MAC in the current scan** — two addresses observed with the same MAC in one
+1. **Strong identifier in the current scan** — a UPnP UDN or mDNS instance name
+   observed on two addresses in one scan is one device.
+2. **Strong identifier in history** — a UDN or mDNS instance matching a stored device
+   within the strong-identifier freshness window links to that device before MAC
+   matching. This preserves identity across address and randomized-MAC changes. If the
+   strong identifier and the MAC match different stored devices, the strong identifier
+   wins and the MAC conflict is recorded as an `uncertain` link with basis
+   `strong_identifier_conflict`.
+3. **Same MAC in the current scan** — two addresses observed with the same MAC in one
    scan are one device.
-2. **Global MAC** — a globally administered MAC matching a stored device within the MAC
+4. **Global MAC** — a globally administered MAC matching a stored device within the MAC
    freshness window (default 24 h) links to the most recently seen matching device. A
    device that changes IP therefore keeps its identity.
-3. **Locally administered MAC** — never merges. A new logical device is created; if the
+5. **Locally administered MAC** — never merges. A new logical device is created; if the
    address matched a stored device, an `uncertain` link with basis
    `locally_administered_mac` preserves the possible relationship.
-4. **IP address** — never sufficient to merge. If an address is observed with a
+6. **IP address** — never sufficient to merge. If an address is observed with a
    different MAC, NetAtlas creates a separate device, records an
    `address_reuse_suspected` observation, and adds an `uncertain` link with basis
    `address_reuse`. If only an IP matches a stored device, it creates a separate device
    and an `uncertain` link with basis `ip_only`.
-5. **Hostname / DNS name** — recorded as a low-confidence identifier. It never merges
-   devices on its own.
-6. **Ambiguous MAC match** — if one global MAC matches multiple stored devices, the most
+7. **Hostname / DNS name / NetBIOS name** — recorded as low-confidence identifiers. They
+   never merge devices on their own.
+8. **Ambiguous MAC match** — if one global MAC matches multiple stored devices, the most
    recently seen device is reused and the competing matches receive `uncertain` links
    with basis `ambiguous_mac`. No automatic merge occurs.
 
-Strong stable identifiers (UPnP UDN, SSH host key fingerprint, TLS certificate
-fingerprint, mDNS instance name, NetBIOS name) are part of the design but are not
-observed by any Phase 1 provider. They will extend this order ahead of MAC once the
-corresponding providers exist.
+UPnP UDNs and mDNS instance names are self-reported, but they are intended to be stable
+and are more specific than a hostname. A UDN is recorded with `high` identifier
+confidence; an mDNS instance with `medium`. SSH host-key and TLS certificate
+fingerprints are part of the design but are not observed yet.
 
 ### 3.3 Locally administered MAC addresses
 
@@ -181,7 +219,7 @@ administered. NetAtlas records this and:
 - does not present OUI output as the device manufacturer;
 - labels the condition `locally_administered_mac` (not automatically "randomized",
   because hypervisors and manually assigned addresses also set this bit);
-- never merges devices on a locally administered MAC alone. Phase 1 records an
+- never merges devices on a locally administered MAC alone. NetAtlas records an
   `uncertain` link instead, even when the address matches exactly.
 
 ### 3.4 Uncertain links
@@ -210,13 +248,15 @@ references the observation that produced it and carries a `source_unit` such as:
 
 ```
 ssdp:<udn>:description:<sha256-of-body>
-mdns:<instance-fullname>:<record-type>
+mdns:<instance-fullname>
+service:<ip>:<port>
 oui:<prefix>:<db-version>
 icmp:<address>:<session-id>
 ```
 
-Phase 1 emits `oui:<prefix-hex>:<snapshot-version>` for OUI evidence. The other forms
-are reserved for the providers that will produce them.
+Phase 2 emits `oui:<prefix-hex>:<snapshot-version>`, `ssdp:<udn-or-location>:description:<hash>`,
+`mdns:<instance-fullname>`, and `service:<ip>:<port>`. All evidence extracted from one
+protocol exchange reuses that exchange's base unit.
 
 Two fields extracted from the same SSDP description share one `source_unit` and count
 as one source. A second, independent protocol observation gets a different unit.
@@ -286,8 +326,9 @@ Inference (conclusion):
 
 ## 5. SQLite schema
 
-Migration `0001_discovery.sql` (Phase 1), plus the migration ledger and connection
-pragmas. DNS, route, and monitoring tables are added by later migrations.
+Migration `0001_discovery.sql` (Phase 1) is unchanged in Phase 2. Phase 2 writes
+mDNS/UPnP/banner observations into the existing `services` table. DNS, route, and
+monitoring tables are added by later migrations.
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -475,7 +516,7 @@ These are not created until their modules exist.
 
 ## 6. Migrations and integrity
 
-Implemented in Phase 1:
+Implemented through Phase 2:
 
 - Migrations are numbered SQL files embedded in the binary, applied inside a
   transaction, in order. `PRAGMA user_version` records the applied version; a database
@@ -513,7 +554,10 @@ Freshness windows used by identification:
 | IP identifier | 24 hours |
 | MAC identifier (global) | 24 hours |
 | Hostname | 7 days (marked stale sooner if contradicted) |
+| NetBIOS name | 7 days |
 | UPnP UDN / mDNS instance / host key | 30 days |
+| Service banner | 24 hours |
+| mDNS / UPnP description fields | 30 days |
 
 These are defaults, not hard-coded truth; they are recorded in session config so a
 historical inference can be explained.

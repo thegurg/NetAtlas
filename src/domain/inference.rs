@@ -186,8 +186,7 @@ pub fn infer_property(
 
     let mut groups: BTreeMap<String, Vec<&EvidenceRecord>> = BTreeMap::new();
     for item in &fresh {
-        let key =
-            serde_json::to_string(&item.candidate).unwrap_or_else(|_| item.candidate.to_string());
+        let key = candidate_key(property, &item.candidate);
         groups.entry(key).or_default().push(item);
     }
 
@@ -302,6 +301,71 @@ fn display_candidate(candidate: &serde_json::Value) -> String {
     }
 }
 
+/// Group candidates that differ only by case, punctuation, or common corporate
+/// suffixes. This avoids reporting a false conflict between, for example,
+/// `Example Networks, Inc.` and `Example Networks`.
+fn candidate_key(property: Property, candidate: &serde_json::Value) -> String {
+    match candidate {
+        serde_json::Value::String(value) => {
+            let mut normalized = value.trim().to_lowercase();
+            if property == Property::Manufacturer {
+                normalized = normalize_manufacturer(&normalized);
+            }
+            normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn normalize_manufacturer(value: &str) -> String {
+    let replaced: String = value
+        .chars()
+        .map(|character| {
+            if matches!(character, ',' | '.' | ';' | '-') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut words: Vec<String> = replaced
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_string()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let suffixes = [
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "ltd",
+        "limited",
+        "llc",
+        "co",
+        "company",
+        "gmbh",
+        "ag",
+        "bv",
+        "nv",
+        "oy",
+        "ab",
+        "as",
+        "kk",
+        "plc",
+        "pty",
+    ];
+    while words
+        .last()
+        .is_some_and(|word| suffixes.contains(&word.as_str()))
+    {
+        words.pop();
+    }
+    words.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -409,5 +473,33 @@ mod tests {
         assert_eq!(record.status, InferenceStatus::Unknown);
         assert_eq!(record.unknown_reason, Some(UnknownReason::NoEvidence));
         assert_eq!(record.confidence, Confidence::Unknown);
+    }
+
+    #[test]
+    fn manufacturer_punctuation_and_suffixes_do_not_conflict() {
+        let record = infer_property(
+            Property::Manufacturer,
+            &[
+                evidence("Example Networks, Inc.", "oui:1", Confidence::Medium, None),
+                evidence("example networks", "ssdp:2", Confidence::Medium, None),
+            ],
+            2_000,
+        );
+        assert_eq!(record.status, InferenceStatus::Supported);
+        assert_eq!(record.confidence, Confidence::High);
+        assert_eq!(record.value, Some(json!("Example Networks, Inc.")));
+    }
+
+    #[test]
+    fn genuinely_different_manufacturers_still_conflict() {
+        let record = infer_property(
+            Property::Manufacturer,
+            &[
+                evidence("Example Networks", "oui:1", Confidence::Medium, None),
+                evidence("Other Vendor", "ssdp:2", Confidence::Medium, None),
+            ],
+            2_000,
+        );
+        assert_eq!(record.status, InferenceStatus::Conflicted);
     }
 }

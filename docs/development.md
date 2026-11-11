@@ -1,7 +1,7 @@
 # NetAtlas development guide
 
-Status: Phase 1 (shared core and discovery) implemented. Phase 2 identification
-providers are not implemented yet.
+Status: Phase 2 (identification providers and evidence fusion) implemented. The TUI,
+DNS diagnostics, route exploration, monitoring, and import/export are not implemented yet.
 
 ## 1. Environment baseline
 
@@ -13,7 +13,7 @@ Inspected on 2026-11-11:
 | Rust | 1.99.1 (stable) |
 | Cargo | 1.99.1 |
 | SQLite CLI | 3.54.1 |
-| Interface | `wlo1`, `192.168.1.4/24`, gateway `192.168.1.1` |
+| Interface | `wlo1`, `172.20.10.6/28`, gateway `172.20.10.1` (at the last live check) |
 | Unprivileged ICMP | allowed (`net.ipv4.ping_group_range = 0 2147483647`) |
 | Current process capabilities | no `CAP_NET_RAW`; ordinary user |
 
@@ -37,13 +37,16 @@ Useful manual checks:
 ```bash
 cargo run -- interfaces
 cargo run -- discover --target 192.168.1.0/24 --timeout-ms 500 --no-dns
+cargo run -- discover --target 192.168.1.0/24 --mdns-window-ms 1500 --json
+cargo run -- discover --target 192.168.1.0/24 --no-mdns --no-ssdp --no-netbios --no-services
 cargo run -- devices
+cargo run -- device <uuid>
 cargo run -- oui status
 cargo run -- oui lookup 3c:cd:5d:11:22:33
 ```
 
-Live-network checks are opt-in and must never run during ordinary `cargo test`. Phase 1
-does not ship a live test target yet; add one only when it states its interface and
+Live-network checks are opt-in and must never run during ordinary `cargo test`. Phase 2
+still does not ship a live test target; add one only when it states its interface and
 scope, never scans broadly, and is marked `#[ignore]`.
 
 No test may depend on the user's real Wi-Fi network, a public DNS resolver, or Internet
@@ -81,6 +84,8 @@ Versions verified against crates.io on 2026-11-11.
 | `rtnetlink` | 0.24.0 | Links, addresses, routes, neighbour table |
 | `surge-ping` | 0.9.1 | Unprivileged ICMP echo |
 | `hickory-resolver` | 0.26.3 | Reverse DNS through the system resolver |
+| `mdns-sd` | 0.21.7 | Bounded mDNS/DNS-SD browse and service resolution |
+| `roxmltree` | 0.21.2 | Bounded UPnP device-description XML parsing |
 | `futures-util` | 0.3.31 | Bounded `buffer_unordered` probe scheduling |
 | `csv` | 1.4.0 | IEEE OUI registry parsing |
 | `sha2` | 0.10.9 | OUI provenance hash |
@@ -89,23 +94,24 @@ Dev dependencies: `tempfile` 3.27, `assert_cmd` 2.2, `predicates` 3.1.
 
 ### Explicitly not chosen
 
+- `reqwest`/`ureq`: SSDP descriptions use a small bounded plain-HTTP client.
 - `pnet`: packet construction is not needed. Add `etherparse` only if a real
   packet-parsing requirement appears.
-- `reqwest`/`ureq`: SSDP descriptions will use a small bounded plain-HTTP client.
 - `oui` / `mac_oui`: see architecture decision D6. NetAtlas parses the IEEE registry
   itself and stores provenance.
 - `macaddr`: the domain has a small tested `MacAddress` type, which avoids an
   unnecessary dependency and keeps local-admin handling explicit.
 - `directories`: XDG resolution is a few lines.
 - `refinery` or another migration framework: a small ordered SQL runner is sufficient.
-- `async-trait` and `socket2`: Phase 1 calls adapters directly and uses Tokio's TCP
+- `async-trait` and `socket2`: Phase 2 calls adapters directly and uses Tokio's TCP
   timeouts. A provider trait will be introduced only when more providers need uniform
   scheduling.
 
 ### Deferred dependencies
 
-`mdns-sd`, `hickory-proto`, `ratatui`, and `crossterm` are planned for later phases and
-are not in `Cargo.toml` yet.
+`hickory-proto`, `ratatui`, and `crossterm` are planned for later phases and are not in
+`Cargo.toml` yet. TLS inspection would require an explicit TLS dependency and a separate
+design review.
 
 ## 4. Code organization and standards
 
@@ -120,6 +126,7 @@ src/
     network.rs            MAC, interfaces, segments, host enumeration
     device.rs             devices, identifiers, links, presentation views
     observation.rs        observed facts and normalized host probes
+    service.rs            transport and persisted service records
     evidence.rs           evidence records and properties
     inference.rs          aggregation, conflict, unknown reasons
     confidence.rs         qualitative confidence rubric
@@ -134,6 +141,10 @@ src/
     icmp.rs               ICMP echo provider
     tcp_probe.rs          bounded TCP connect fallback
     reverse_dns.rs        PTR lookup adapter
+    mdns.rs               bounded mDNS/DNS-SD browse adapter
+    ssdp.rs               SSDP M-SEARCH and bounded UPnP description fetch
+    netbios.rs            wildcard NBSTAT name queries
+    service_probe.rs      bounded HTTP/SSH/FTP/SMTP banner probes
     oui.rs                IEEE CSV parser, embedded snapshot, lookup
     storage/              SQLite store, migrations, repositories
   cli/                    clap definitions, human/JSON output, exit codes
@@ -160,10 +171,14 @@ Standards:
 | Subnet/host enumeration | Pure unit tests, including /31, /32, oversized prefixes | `src/domain/network.rs` |
 | MAC/OUI | Parser tests, longest-prefix match, local-admin detection, malformed input | `src/domain/network.rs`, `src/infrastructure/oui.rs` |
 | Identity resolution | Same MAC/new IP, same IP/new MAC, local MAC, IP-only, expiry | `src/application/identity.rs` |
-| Evidence/inference | Agreement, conflict, correlated units, expiry, OUI, unknown reasons | `src/domain/inference.rs`, `src/application/identify.rs` |
-| Probe aggregation | ICMP/TCP/neighbour/reverse-DNS facts, timeout is not presence | `src/application/discovery.rs` |
+| Evidence/inference | Agreement, conflict, correlated units, expiry, OUI, protocol evidence, unknown reasons | `src/domain/inference.rs`, `src/application/identify.rs` |
+| Probe aggregation | ICMP/TCP/neighbour/reverse-DNS facts, protocol responses as presence, timeout is not presence | `src/application/discovery.rs` |
+| mDNS | TXT property parsing, service-type category mapping | `src/infrastructure/mdns.rs` |
+| SSDP/UPnP | Header parsing, bounded HTTP body, XML fields, malformed XML rejection | `src/infrastructure/ssdp.rs` |
+| NetBIOS | NBSTAT query layout, name-table parsing, group bit, compressed names | `src/infrastructure/netbios.rs` |
+| Service probes | HTTP/SSH/FTP/SMTP banner parsing, local SSH banner, cancellation | `src/infrastructure/service_probe.rs` |
 | TCP probe outcomes | Local listener open/refused, cancellation | `src/infrastructure/tcp_probe.rs` |
-| SQLite | `:memory:` migrations, OUI import/lookup, scan round-trip | `src/infrastructure/storage/mod.rs` |
+| SQLite | `:memory:` migrations, OUI import/lookup, scan and service round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
 | CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, OUI import/lookup | `tests/cli.rs` |
 
 ### Fixtures
@@ -220,18 +235,37 @@ Deliverables implemented:
 - Deterministic tests for pure logic, migrations, storage round-trip, TCP probes, and
   CLI behavior.
 
-Phase 1 limitations are listed in the README and in `docs/identification.md`.
+Phase 2 limitations are listed in the README and in `docs/identification.md`.
 
-### Phase 2 — identification (next)
+### Phase 2 — identification (done)
 
-Deliverables: mDNS, SSDP/UPnP descriptions, NetBIOS, safe TCP service probes; full
-evidence fusion, conflict handling, independence units; device category/OS/model rules;
-profile explanations; fixture suite from `docs/identification.md` section 9.
+Deliverables implemented:
 
-Acceptance: the identification acceptance scenarios pass; multiple independent sources
-can contribute; conflicts are preserved; model/OS are not invented.
+- mDNS/DNS-SD provider with a bounded browse window and conservative service-type
+  category mapping.
+- SSDP M-SEARCH plus unicast discovery, bounded plain-HTTP UPnP description fetch, and
+  `roxmltree` parsing.
+- NetBIOS wildcard NBSTAT queries; names are recorded as identifiers, not verified
+  properties.
+- Safe TCP service probes for HTTP, SSH, FTP, and SMTP with bounded connects, request
+  size, response size, and timeouts.
+- Evidence extraction for manufacturer, category, OS family, and model from OUI, UPnP,
+  mDNS, and banner OS hints; correlated fields share one source unit.
+- Strong-identifier linking by UPnP UDN and mDNS instance, including conflict links
+  against MAC matches.
+- Provider-aware unknown reasons (`provider_unavailable` vs `no_evidence`).
+- Service observations persisted in the existing `services` table and shown by
+  `discover` and `device`.
+- CLI flags `--no-mdns`, `--no-ssdp`, `--no-netbios`, `--no-services`, and
+  `--mdns-window-ms`.
+- Deterministic parser, inference, identity, storage, and aggregation tests.
 
-### Phase 3 — LAN inventory and map
+Phase 2 limitations: no TLS inspection, SSH host keys, or certificate fingerprints;
+service probes cover a small plain-text port set and only hosts that answered discovery;
+mDNS/SSDP/NetBIOS results depend on multicast and firewall conditions; exact OS versions
+and specific device models are not invented.
+
+### Phase 3 — LAN inventory and map (next)
 
 Deliverables: device history, segments, new/disappeared/changed events, search/filter,
 segment-based map representation, stale data indicators.

@@ -27,6 +27,8 @@ toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.2", features = ["serde", "v7"] }
+mdns-sd = "0.21.7"
+roxmltree = "0.21.2"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

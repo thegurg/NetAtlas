@@ -1,7 +1,7 @@
 # NetAtlas architecture
 
-Status: Phase 1 implemented (shared core and discovery). Later-phase modules are
-described where they affect the current boundaries, but they do not exist yet.
+Status: Phase 2 implemented (identification providers and evidence fusion). Later-phase
+modules are described where they affect the current boundaries, but they do not exist yet.
 
 ## 1. Goals and non-goals
 
@@ -58,9 +58,9 @@ Rules:
 
 - `domain` depends only on `std`, `serde`, `serde_json`, `ipnet`, `chrono`, `uuid`,
   `thiserror`. No sockets, no SQLite, no terminal, no async runtime.
-- `application` depends on `domain` and on concrete infrastructure adapters in Phase 1.
-  It orchestrates I/O but contains no socket setup and no SQL. A port trait layer will be
-  introduced when more providers need uniform scheduling.
+- `application` depends on `domain` and on concrete infrastructure adapters. It
+  orchestrates I/O but contains no socket setup and no SQL. A port trait layer will be
+  introduced only when it genuinely simplifies dispatch.
 - `infrastructure` contains the adapters. Protocol parsing is separated from socket
   operations so it can be tested from fixtures (OUI parsing is the current example).
 - `cli` depends on application services and domain types. It contains no discovery,
@@ -80,6 +80,7 @@ src/
     network.rs            MAC, interface, address, segment, gateway, host enumeration
     device.rs             devices, identifiers, identity links, presentation views
     observation.rs        observed facts, host probes, normalized host observations
+    service.rs            transport and persisted service records
     evidence.rs           evidence, properties, source units
     inference.rs          candidate conclusions, conflicts, unknown reasons
     confidence.rs         confidence enum and aggregation rubric
@@ -94,15 +95,18 @@ src/
     icmp.rs               ICMP echo provider (surge-ping)
     tcp_probe.rs          bounded TCP connect fallback
     reverse_dns.rs        PTR lookup through hickory
+    mdns.rs               bounded mDNS/DNS-SD browse adapter
+    ssdp.rs               SSDP M-SEARCH plus bounded UPnP description fetch
+    netbios.rs            wildcard NBSTAT name-table queries
+    service_probe.rs      bounded HTTP/SSH/FTP/SMTP banner probes
     oui.rs                IEEE registry parser, embedded snapshot, lookup
     storage/              SQLite store, migrations, repositories
   cli/                    clap definitions, handlers, table/JSON output
 ```
 
 Planned later modules: `application/inventory.rs`, `application/dns.rs`,
-`application/route.rs`, `application/monitor.rs`, `application/export.rs`,
-`infrastructure/{mdns,ssdp,netbios,service}/`, and `tui/`. They are not created as
-empty placeholders.
+`application/route.rs`, `application/monitor.rs`, `application/export.rs`, and `tui/`.
+They are not created as empty placeholders.
 
 Feature modules (`discovery`, `identification`, `lan`, `dns`, `route`, `monitoring`)
 are realized as application services plus infrastructure adapters, not as separate
@@ -120,8 +124,8 @@ scan session scope: interface and/or target prefix, methods, limits
         |
         v
 providers run concurrently, each emitting normalized observations
-  Phase 1: neighbour table | ICMP echo | TCP connect | reverse DNS
-  later:   mDNS | SSDP | NetBIOS | service banners
+  Phase 2: neighbour table | ICMP echo | TCP connect | reverse DNS
+           mDNS | SSDP/UPnP | NetBIOS | service banners
         |
         v
 observation stream (facts only, with source, method, timestamp, details)
@@ -151,15 +155,19 @@ DNS and route measurements follow the same shape: a measurement is recorded with
 method, target, resolver/probe parameters, timing, and result. Comparison is a pure
 domain operation over stored measurements.
 
-## 5. Provider contract in Phase 1
+## 5. Provider contract in Phase 2
 
-Phase 1 uses concrete adapters with narrow async functions rather than a dyn-compatible
-trait:
+Phase 2 still uses concrete adapters with narrow async functions rather than a
+dyn-compatible trait:
 
 ```rust
 icmp::sweep(&addresses, timeout, concurrency, &cancel).await
 tcp_probe::probe_hosts(&addresses, ports, timeout, concurrency, &cancel).await
 reverse_dns::lookup(&addresses, timeout, concurrency, &cancel).await
+mdns::discover(&service_types, window, &cancel).await
+ssdp::discover(&addresses, timeout, &cancel).await
+netbios::query_hosts(&addresses, timeout, concurrency, &cancel).await
+service_probe::probe_hosts(&addresses, ports, timeout, concurrency, &cancel).await
 netlink::snapshot().await
 ```
 
@@ -169,14 +177,20 @@ adapter returns typed results and errors:
 - A provider failure is recorded in `ProviderReport` and does not cancel other
   providers. The session becomes `partial`.
 - `ScanOptions` carries the explicit interface/target scope, timeouts, concurrency
-  limit, and `max_hosts`. Adapters must not invent their own scope.
+  limit, `max_hosts`, the mDNS window, and per-provider enable flags. Adapters must not
+  invent their own scope.
 - `CancellationToken` is checked before each probe; in-flight probes are bounded by the
-  per-operation timeout.
+  per-operation timeout and, for mDNS, the browse window.
+- mDNS, SSDP, and NetBIOS are only sent to the resolved candidate set. Service probes run
+  only against addresses that already answered discovery.
+- The identification layer receives a `ProviderAvailability` snapshot derived from the
+  provider reports, so `unknown` can distinguish `no_evidence` from
+  `provider_unavailable`.
 
-A provider trait will be introduced when Phase 2 adds mDNS, SSDP, NetBIOS, and service
-probes and the orchestration needs uniform scheduling. Test doubles can then implement
-that trait; today the pure aggregation and identity functions are tested directly from
-fixture observations.
+A provider trait is still deferred. The adapters have different result shapes (host
+lists, service lists, name lists), so a single trait would add dispatch without removing
+meaningful orchestration. Test doubles are not needed because parsing and aggregation are
+tested directly from fixture bytes and observations.
 
 ## 6. Concurrency and cancellation
 
@@ -186,9 +200,11 @@ fixture observations.
 - Probes use `futures_util::buffer_unordered` with the configured concurrency (default
   64). There is no unbounded spawning. `max_hosts` bounds the candidate set before any
   probe is sent.
-- Per-operation timeouts are explicit (`--timeout-ms`, `--dns-timeout-ms`). There is no
-  separate whole-provider deadline yet; the candidate and concurrency bounds keep the
-  total work finite.
+- Per-operation timeouts are explicit (`--timeout-ms`, `--dns-timeout-ms`). The mDNS
+  browse is additionally capped by `--mdns-window-ms` (default 3 s). SSDP sends are
+  bounded by the per-operation timeout and each description fetch is individually
+  timed out and size-limited. There is no separate whole-provider deadline beyond these
+  bounds, so a scan's total work remains finite.
 - `Ctrl-C` (CLI) triggers a `CancellationToken`. The session is finalized as
   `cancelled` with whatever observations were already recorded. The CLI exits with code
   3 because the result is incomplete.
@@ -242,9 +258,12 @@ reports carry typed errors, so automation can distinguish complete from partial 
 - Observation history is append-oriented. Current device profiles are derived from
   identifiers and the latest inference per property.
 - One scan writes its session, devices, identifiers, observations, evidence,
-  inferences, and identity links in one transaction. A failure rolls the whole scan
-  back. A crash can leave a `running` session; finalizing it as `interrupted` on next
-  startup is not implemented yet.
+  inferences, identity links, and service observations in one transaction. A failure
+  rolls the whole scan back. A crash can leave a `running` session; finalizing it as
+  `interrupted` on next startup is not implemented yet.
+- The `services` table stores mDNS, UPnP, and TCP banner observations. It is the same
+  service inventory surfaced by `discover` and `device`; it is not a second, unrelated
+  data path.
 - `Store::open` imports the embedded OUI snapshot on first use. `Store::open_in_memory`
   is used by tests and does not import it automatically.
 
@@ -309,7 +328,7 @@ per-record TTL. Enable `dnssec-ring` and use hickory-proto validation primitives
 produce an explicit state: `secure`, `insecure`, `bogus`, `indeterminate`, `unsupported`.
 Presence of DNSKEY/DS/RRSIG records is never reported as successful validation.
 
-Phase 1 uses hickory only for reverse-DNS PTR lookups in discovery. The validation
+Phase 2 uses hickory only for reverse-DNS PTR lookups in discovery. The validation
 states belong to the DNS diagnostics phase and are not reported by `discover`.
 
 Alternative: a hand-written DNS client. Rejected: too much protocol surface for the value.
@@ -355,12 +374,13 @@ plain hex forms, plus explicit local-admin and multicast checks. This keeps the
 local-admin rule visible at the type boundary and avoids a dependency whose API and
 license would need separate review.
 
-### D14 — Direct provider adapters in Phase 1
+### D14 — Direct provider adapters in Phase 2
 
-Phase 1 has three active probe families and no third-party provider plugins. Direct
-async functions keep scheduling, cancellation, and error mapping in one readable
-orchestrator. The planned `DiscoveryProvider` trait is deferred until Phase 2 adds more
-providers and test doubles genuinely benefit from uniform dispatch.
+Phase 2 has eight provider families and no third-party provider plugins. Direct async
+functions keep scheduling, cancellation, and error mapping in one readable orchestrator.
+The planned `DiscoveryProvider` trait remains deferred because the adapters return
+different shapes and the orchestration still needs provider-specific ordering (for
+example, service probes must run after discovery has found answering hosts).
 
 ### D15 — Neighbour table re-read after active probes
 
@@ -378,9 +398,24 @@ in-memory `oui_entries()` loader reads only the latest source.
 
 ### D17 — SQLite writes stay on the scan task for now
 
-The Phase 1 CLI has no render loop, so one transaction at the end of a scan is simpler
+The current CLI has no render loop, so one transaction at the end of a scan is simpler
 and safer than a writer task. When the TUI arrives, persistence will move behind a
 writer task or a blocking pool so rendering is never blocked.
+
+### D18 — Strong identifiers link before MAC
+
+UPnP UDNs and mDNS instance names are self-reported, but they are intended to survive
+address and randomized-MAC changes. They are therefore matched before MAC addresses. A
+strong identifier that conflicts with a MAC match wins, and the competing MAC match is
+preserved as an `uncertain` link rather than discarded. A locally administered MAC still
+never merges on its own.
+
+### D19 — Service probes only run against hosts that answered
+
+Probing every candidate on the service port list would turn discovery into an
+unrequested port scan. The orchestrator therefore runs service probes only for
+addresses that already produced a positive discovery observation. The port set is
+small, plain-text only, and does not include TLS handshakes or authentication.
 
 ## 11. Known limitations to design around
 
@@ -389,12 +424,12 @@ writer task or a blocking pool so rendering is never blocked.
 - Mobile devices sleep, randomize MACs, and expose little metadata.
 - OUI data maps address blocks, not devices. Virtual machines and hypervisors use
   locally administered addresses.
-- Phase 1 cannot merge a locally administered MAC on its own, so privacy-randomized
-  clients and many virtual machines create a new logical device per scan plus an
-  uncertain link. This is intentional until stronger identifiers exist.
-- A host seen only through ICMP, with no MAC, also creates a new logical device per scan
-  because IP alone never merges.
-- Hostnames are claims, not verified identities.
+- A locally administered MAC still cannot merge on its own, so privacy-randomized clients
+  without a matching UDN or mDNS instance create a new logical device per scan plus an
+  uncertain link. Strong identifiers reduce this when the device publishes them.
+- A host seen only through ICMP, with no MAC and no strong identifier, also creates a new
+  logical device per scan because IP alone never merges.
+- Hostnames and NetBIOS names are claims, not verified identities.
 - Service banners and UPnP/mDNS descriptions are self-reported and can be stale or
   misleading.
 - Exact phone/PC model identification is usually impossible from LAN observations.
@@ -403,8 +438,11 @@ writer task or a blocking pool so rendering is never blocked.
 - The local resolver may cache answers; reverse DNS is a naming hint, not a verified
   identity. DNS diagnostics must record the resolver and cannot claim authoritative
   freshness.
-- Phase 1 has no mDNS, SSDP, NetBIOS, or service banners, so category/OS/model have no
-  possible evidence and are always `unknown` with a reason.
+- mDNS results depend on multicast reachability and the platform daemon; SSDP depends on
+  plain HTTP descriptions being reachable; NetBIOS is often disabled or filtered. A
+  provider that ran and found nothing is `no_evidence`, not proof of absence.
+- Service probing covers a small plain-text port set. TLS-only services, SSH host keys,
+  and TLS certificate fingerprints are not captured yet.
 - A provider failure makes the session `partial`; it does not imply that the failed
   method found nothing.
 

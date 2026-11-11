@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::domain::{
     DeviceRecord, EvidenceRecord, HostObservation, IdentityLink, InferenceRecord, MacAddress,
-    NetworkContext, ObservationRecord,
+    NetworkContext, ObservationRecord, ServiceRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,10 @@ pub enum DiscoveryMethod {
     Tcp,
     Neighbor,
     ReverseDns,
+    Mdns,
+    Ssdp,
+    Netbios,
+    ServiceProbe,
 }
 
 impl DiscoveryMethod {
@@ -26,6 +30,10 @@ impl DiscoveryMethod {
             Self::Tcp => "tcp",
             Self::Neighbor => "neighbor",
             Self::ReverseDns => "reverse_dns",
+            Self::Mdns => "mdns",
+            Self::Ssdp => "ssdp",
+            Self::Netbios => "netbios",
+            Self::ServiceProbe => "service_probe",
         }
     }
 }
@@ -114,8 +122,10 @@ pub struct ScanScope {
 pub struct ScanConfig {
     pub timeout_ms: u64,
     pub dns_timeout_ms: u64,
+    pub mdns_window_ms: u64,
     pub concurrency: usize,
     pub max_hosts: usize,
+    pub service_ports: Vec<u16>,
     pub methods: Vec<DiscoveryMethod>,
 }
 
@@ -152,6 +162,8 @@ pub struct ExistingDevice {
     pub macs: Vec<(MacAddress, i64)>,
     pub ips: Vec<(IpAddr, i64)>,
     pub hostnames: Vec<(String, i64)>,
+    pub upnp_udns: Vec<(String, i64)>,
+    pub mdns_instances: Vec<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +177,7 @@ pub struct ScanResult {
     pub context: NetworkContext,
     pub hosts: Vec<HostObservation>,
     pub devices: Vec<ResolvedDevice>,
+    pub services: Vec<ServiceRecord>,
     pub observations: Vec<ObservationRecord>,
     pub evidence: Vec<EvidenceRecord>,
     pub inferences: Vec<InferenceRecord>,

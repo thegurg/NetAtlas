@@ -3,17 +3,19 @@
 Linux-first network exploration and diagnostics in Rust, with a CLI and a TUI over one
 shared engine and SQLite history.
 
-> **Status: Phase 1 — shared core and discovery.** The CLI, discovery providers,
-> identity resolution, OUI lookup, evidence/inference pipeline, and SQLite persistence
-> are implemented. The TUI, DNS diagnostics, route exploration, monitoring, and
-> mDNS/SSDP/NetBIOS/service probing are not implemented yet. This README describes what
-> works now and what remains limited; it is not a claim that later-phase features exist.
+> **Status: Phase 2 — identification.** The CLI, discovery providers, identity
+> resolution, OUI lookup, evidence/inference pipeline, mDNS, SSDP/UPnP, NetBIOS, safe
+> TCP service probes, and SQLite persistence are implemented. The TUI, DNS diagnostics,
+> route exploration, monitoring, and import/export are not implemented yet. This README
+> describes what works now and what remains limited; it is not a claim that later-phase
+> features exist.
 
 ## What works now
 
 ```bash
 netatlas interfaces
 netatlas discover [--interface wlo1] [--target 192.168.1.0/24]
+netatlas discover --target 192.168.1.0/24 --no-mdns --no-ssdp --no-netbios --no-services
 netatlas devices
 netatlas device <uuid>
 netatlas oui status
@@ -26,7 +28,7 @@ Every command supports `--json`, `--help`, and the documented exit codes. A glob
 
 ### Discovery
 
-Phase 1 uses four sources:
+Phase 2 uses these sources:
 
 1. The kernel neighbour table (netlink `RTM_GETNEIGH`), including a re-read after active
    probes so ARP/NDP entries learned during the scan are visible.
@@ -34,49 +36,79 @@ Phase 1 uses four sources:
 3. A bounded TCP connect fallback on a small fixed port set when ICMP is unavailable or
    silent. A refusal counts as a response; a timeout does not.
 4. Reverse DNS (PTR) for hosts that actually answered.
+5. mDNS/DNS-SD browsing for a bounded window (`--mdns-window-ms`, default 3 s).
+6. SSDP M-SEARCH plus unicast probes, with a bounded plain-HTTP UPnP description fetch.
+7. NetBIOS wildcard NBSTAT queries; names are claims, not verified identities.
+8. Safe TCP service probes (HTTP `HEAD`, SSH/FTP/SMTP banners) on ports 21, 22, 25, 80,
+   and 8080, only for hosts that already answered.
 
-Scans are explicit in scope, bounded by `--max-hosts` and `--concurrency`, and
-cancellable with Ctrl-C. A provider failure is recorded and does not erase other
-results; the session becomes `partial`.
+Each provider can be disabled with `--no-icmp`, `--no-tcp`, `--no-dns`, `--no-mdns`,
+`--no-ssdp`, `--no-netbios`, or `--no-services`. Scans are explicit in scope, bounded by
+`--max-hosts` and `--concurrency`, and cancellable with Ctrl-C. A provider failure is
+recorded and does not erase other results; the session becomes `partial`.
 
 ### Identification
 
-The only property with real evidence in Phase 1 is **manufacturer**, from the IEEE OUI
-registry. It is reported as an address-block association at `medium` confidence, never
-as proof of model, ownership, or OS. Locally administered MAC addresses are never
-OUI-attributed; the reason is shown as `locally_administered_mac`.
+Phase 2 extracts evidence for four properties:
 
-Category, OS, and model are always `unknown` with an explicit reason
-(`no_evidence`) because no Phase 1 provider observes protocol fields that could support
-them. NetAtlas does not guess.
+- **Manufacturer** from the IEEE OUI registry (`medium`, an address-block association),
+  an explicit UPnP `manufacturer` field (`medium`), or mDNS TXT
+  `manufacturer`/`vendor` (`low`). Locally administered MAC addresses are never
+  OUI-attributed; the reason is shown as `locally_administered_mac`.
+- **Category** from unambiguous UPnP device types and mDNS service types (`medium`).
+  Open ports alone never establish a category.
+- **OS family** from explicit SSH/FTP/SMTP/HTTP banner hints and mDNS TXT fields
+  (`low`). Families are canonicalized (`Linux`, `Windows`, `macOS`, ...); TTL is never
+  used.
+- **Model** from explicit UPnP `modelName`/`modelNumber` (`medium`) or mDNS TXT model
+  fields (`low`).
+
+Agreement between independent sources can raise confidence to `high`; disagreement
+produces `conflicted` with both candidates preserved. When relevant providers were
+disabled or failed, the property is `unknown` with `provider_unavailable`; when they ran
+and found nothing, the reason is `no_evidence`. NetAtlas does not guess.
+
+Service observations (port, transport, protocol, product, version, banner) are persisted
+and shown separately. Product/version strings are self-reported service metadata and are
+not promoted to device manufacturer or model evidence.
 
 ### Identity
 
+- A UPnP UDN or mDNS instance name links devices ahead of MAC. A conflict between a
+  strong identifier and a MAC match is preserved as an `uncertain` link.
 - A globally administered MAC within the freshness window links to the device that last
   held it.
 - A locally administered MAC is weak evidence and never merges devices on its own; an
   `uncertain` link is recorded instead.
 - An IP address never merges devices. Address reuse creates a separate device, an
   `address_reuse_suspected` observation, and an `uncertain` link.
-- Hostnames never merge devices on their own.
-- A device that changes IP keeps its identity when the MAC links it.
+- Hostnames and NetBIOS names never merge devices on their own.
+- A device that changes IP keeps its identity when the MAC or a strong identifier links
+  it.
 
 ### Persistence
 
 SQLite schema migration `0001_discovery` stores interfaces, addresses, segments, scan
-sessions, devices, identifiers, observations, evidence, inferences, identity links, and
-OUI sources/prefixes. Foreign keys and WAL are enabled. The IEEE MA-L/MA-M/MA-S snapshot
-under `data/oui/` is embedded in the binary and imported on first open.
+sessions, devices, identifiers, observations, evidence, inferences, identity links,
+services, and OUI sources/prefixes. Foreign keys and WAL are enabled. The IEEE
+MA-L/MA-M/MA-S snapshot under `data/oui/` is embedded in the binary and imported on first
+open.
 
 ## Current limitations
 
-- No mDNS, SSDP/UPnP, NetBIOS, or service/banner probing yet. Those are Phase 2 and are
-  what would supply category/OS/model evidence.
-- Locally administered MACs (including many virtual machines and privacy-randomized
-  clients) produce a new logical device per scan plus an uncertain link. This is
-  intentional until stronger identifiers exist.
-- A host observed only through ICMP with no MAC also produces a new device per scan; IP
-  alone is never used to merge.
+- mDNS results depend on multicast reachability and the platform daemon; SSDP depends on
+  plain HTTP descriptions being reachable; NetBIOS is often disabled or filtered. A
+  provider that ran and found nothing is `no_evidence`, not proof of absence.
+- Service probes cover a small plain-text port set and only hosts that already answered
+  discovery. TLS-only services, SSH host keys, and TLS certificate fingerprints are not
+  captured yet.
+- Banners and UPnP/mDNS descriptions are self-reported and can be stale or misleading.
+  They are evidence, not verified facts.
+- Locally administered MACs without a matching UDN or mDNS instance still produce a new
+  logical device per scan plus an uncertain link. Strong identifiers reduce this when
+  the device publishes them.
+- A host observed only through ICMP with no MAC and no strong identifier also produces a
+  new device per scan; IP alone is never used to merge.
 - Wi-Fi client isolation, firewalls, sleeping devices, and multicast filtering can hide
   peers and evidence. A scan with no result is not proof that a segment is empty.
 - The local resolver may cache PTR answers; reverse DNS is a naming hint, not identity.
@@ -94,8 +126,9 @@ cargo run -- --help
 ```
 
 Deterministic tests cover domain rules, OUI parsing/lookup, identity resolution,
-inference, SQLite migration/round-trip, TCP probe outcomes, and CLI behavior. They do not
-require a live network.
+inference, protocol parsers (mDNS/SSDP/NetBIOS/service banners), SQLite
+migration/round-trip, TCP probe outcomes, and CLI behavior. They do not require a live
+network.
 
 ## Principles
 
