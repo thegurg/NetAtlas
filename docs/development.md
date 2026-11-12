@@ -1,7 +1,8 @@
 # NetAtlas development guide
 
-Status: Phase 2 (identification providers and evidence fusion) implemented. The TUI,
-DNS diagnostics, route exploration, monitoring, and import/export are not implemented yet.
+Status: Phase 3 (LAN inventory, history, change detection, and segment map) implemented.
+The TUI, DNS diagnostics, route exploration, monitoring, and import/export are not
+implemented yet.
 
 ## 1. Environment baseline
 
@@ -38,6 +39,10 @@ Useful manual checks:
 cargo run -- interfaces
 cargo run -- discover --target 192.168.1.0/24 --timeout-ms 500 --no-dns
 cargo run -- discover --target 192.168.1.0/24 --mdns-window-ms 1500 --json
+cargo run -- devices --segment 192.168.1.0/24 --stale
+cargo run -- map --json
+cargo run -- changes --json
+cargo run -- history <device-uuid> --json
 cargo run -- discover --target 192.168.1.0/24 --no-mdns --no-ssdp --no-netbios --no-services
 cargo run -- devices
 cargo run -- device <uuid>
@@ -45,8 +50,8 @@ cargo run -- oui status
 cargo run -- oui lookup 3c:cd:5d:11:22:33
 ```
 
-Live-network checks are opt-in and must never run during ordinary `cargo test`. Phase 2
-still does not ship a live test target; add one only when it states its interface and
+Live-network checks are opt-in and must never run during ordinary `cargo test`. The
+project still does not ship a live test target; add one only when it states its interface and
 scope, never scans broadly, and is marked `#[ignore]`.
 
 No test may depend on the user's real Wi-Fi network, a public DNS resolver, or Internet
@@ -178,8 +183,10 @@ Standards:
 | NetBIOS | NBSTAT query layout, name-table parsing, group bit, compressed names | `src/infrastructure/netbios.rs` |
 | Service probes | HTTP/SSH/FTP/SMTP banner parsing, local SSH banner, cancellation | `src/infrastructure/service_probe.rs` |
 | TCP probe outcomes | Local listener open/refused, cancellation | `src/infrastructure/tcp_probe.rs` |
-| SQLite | `:memory:` migrations, OUI import/lookup, scan and service round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
-| CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, OUI import/lookup | `tests/cli.rs` |
+| Inventory | Freshness, new/not-observed events, partial caveat, address/MAC/hostname/inference changes, unchanged devices | `src/domain/inventory.rs` |
+| Inventory views | Scope matching, history, search/filter, longest-prefix segment grouping, unassigned devices | `src/application/inventory.rs` |
+| SQLite | `:memory:` migrations, OUI import/lookup, scan/service/snapshot round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
+| CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, filters, map/changes/history, OUI import/lookup | `tests/cli.rs` |
 
 ### Fixtures
 
@@ -265,12 +272,27 @@ service probes cover a small plain-text port set and only hosts that answered di
 mDNS/SSDP/NetBIOS results depend on multicast and firewall conditions; exact OS versions
 and specific device models are not invented.
 
-### Phase 3 — LAN inventory and map (next)
+### Phase 3 — LAN inventory and map (done)
 
-Deliverables: device history, segments, new/disappeared/changed events, search/filter,
-segment-based map representation, stale data indicators.
+Deliverables implemented:
 
-### Phase 4 — DNS analysis
+- Migration `0002_inventory` with per-session device snapshots.
+- Device history across recorded sessions.
+- Logical segment grouping from recorded IP prefixes, with longest-prefix matching.
+- Derived `new_device`, `not_observed`, `ip_changed`, `mac_changed`,
+  `hostname_changed`, and `inference_changed` events.
+- Scope-aware comparison: same interface and target, completed or partial sessions only.
+- `not_observed` wording and partial-scan caveats; absence is never reported as offline.
+- Search/filter by text, segment, and staleness; overridable stale threshold.
+- Stale indicators for devices and segments with an explicit non-offline note.
+- CLI commands `map`, `changes`, and `history`, plus `devices` filters.
+- Deterministic tests for snapshots, comparison, filtering, grouping, and CLI behavior.
+
+Phase 3 limitations: history begins with the first scan after migration `0002_inventory`;
+the map is logical subnet grouping, not physical topology; stale data is not an offline
+determination; change events are derived on read rather than stored.
+
+### Phase 4 — DNS analysis (next)
 
 Deliverables: A/AAAA/CNAME/MX/NS/TXT/SOA queries, custom resolvers, timing, RCODE, TTL,
 resolver comparison, explicit DNSSEC validation state, DNS history.

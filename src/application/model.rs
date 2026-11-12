@@ -2,12 +2,13 @@
 
 use std::net::IpAddr;
 
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
-    DeviceRecord, EvidenceRecord, HostObservation, IdentityLink, InferenceRecord, MacAddress,
-    NetworkContext, ObservationRecord, ServiceRecord,
+    DeviceRecord, DeviceSessionSnapshot, EvidenceRecord, HostObservation, IdentityLink,
+    InferenceRecord, MacAddress, NetworkContext, ObservationRecord, ServiceRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +165,56 @@ pub struct ExistingDevice {
     pub hostnames: Vec<(String, i64)>,
     pub upnp_udns: Vec<(String, i64)>,
     pub mdns_instances: Vec<(String, i64)>,
+}
+
+/// A persisted scan session, without its full observation payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub id: Uuid,
+    pub scope: ScanScope,
+    pub methods: Vec<DiscoveryMethod>,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub status: SessionStatus,
+    pub errors: Vec<ProviderErrorInfo>,
+    pub device_count: usize,
+}
+
+impl SessionStatus {
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "partial" => Some(Self::Partial),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+
+    /// Only completed or partial scans are useful for change comparison.
+    pub fn is_comparable(self) -> bool {
+        matches!(self, Self::Completed | Self::Partial)
+    }
+}
+
+/// A logical IP segment recorded from network context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentRecord {
+    pub id: Uuid,
+    pub interface: String,
+    pub prefix: IpNet,
+    pub gateway: Option<IpAddr>,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+/// One session in a device's inventory history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceHistoryEntry {
+    pub session: SessionRecord,
+    pub snapshot: DeviceSessionSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

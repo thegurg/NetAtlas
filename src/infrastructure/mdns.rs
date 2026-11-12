@@ -64,10 +64,12 @@ pub async fn discover(
     }
     if receivers.is_empty() {
         let _ = daemon.shutdown();
-        return Ok(MdnsDiscovery {
-            services: Vec::new(),
-            warnings,
-        });
+        let detail = if warnings.is_empty() {
+            "no mDNS service types could be browsed".to_string()
+        } else {
+            warnings.join("; ")
+        };
+        return Err(MdnsError::Daemon(detail));
     }
 
     let (sender, mut receiver) = tokio::sync::mpsc::channel(128);

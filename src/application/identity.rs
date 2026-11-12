@@ -33,6 +33,9 @@ pub const DEFAULT_MAC_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Default window in which an IP address is still considered a previous holder.
 pub const DEFAULT_IP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 
+/// Default window in which a UPnP UDN or mDNS instance name still links.
+pub const DEFAULT_STRONG_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
 #[derive(Debug, Clone)]
 pub struct IdentityResolution {
     pub devices: Vec<ResolvedDevice>,
@@ -133,11 +136,11 @@ fn select_device(
         for device in existing {
             let found = match kind {
                 IdentifierKind::UpnpUdn => device.upnp_udns.iter().any(|(candidate, last_seen)| {
-                    candidate == value && *last_seen >= now_ms - mac_window_ms
+                    candidate == value && *last_seen >= now_ms - DEFAULT_STRONG_WINDOW_MS
                 }),
                 IdentifierKind::MdnsInstance => {
                     device.mdns_instances.iter().any(|(candidate, last_seen)| {
-                        candidate == value && *last_seen >= now_ms - mac_window_ms
+                        candidate == value && *last_seen >= now_ms - DEFAULT_STRONG_WINDOW_MS
                     })
                 }
                 _ => false,
@@ -916,6 +919,25 @@ mod tests {
         assert_eq!(resolved.devices.len(), 1);
         assert_eq!(resolved.devices[0].id, previous.id);
         assert!(!resolved.devices[0].is_new);
+    }
+
+    #[test]
+    fn upnp_udn_links_beyond_the_mac_window() {
+        let mut previous = existing("00:11:22:33:44:55", "192.168.1.10");
+        previous.upnp_udns.push(("1234".to_string(), 900));
+        let now = 900 + 2 * super::DEFAULT_MAC_WINDOW_MS;
+        let observation = with_probe(
+            host("192.168.1.11", None),
+            upnp_probe("192.168.1.11", "uuid:1234"),
+        );
+        let resolved = resolve(
+            &[observation],
+            std::slice::from_ref(&previous),
+            now,
+            super::DEFAULT_MAC_WINDOW_MS,
+        );
+        assert_eq!(resolved.devices.len(), 1);
+        assert_eq!(resolved.devices[0].id, previous.id);
     }
 
     #[test]

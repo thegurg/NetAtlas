@@ -308,7 +308,9 @@ impl NetworkContext {
 }
 
 pub fn prefix_for_address(address: &InterfaceAddress) -> Option<IpNet> {
-    IpNet::new(address.address, address.prefix_len).ok()
+    IpNet::new(address.address, address.prefix_len)
+        .ok()
+        .map(|prefix| prefix.trunc())
 }
 
 /// Enumerate candidate IPv4 hosts in a prefix.

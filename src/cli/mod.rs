@@ -8,12 +8,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use ipnet::IpNet;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::discovery::{self, ScanOptions};
+use crate::application::inventory::{self, ChangeReport, DeviceFilter, DeviceHistory, SegmentMap};
 use crate::application::model::{ScanResult, SessionStatus};
 use crate::config::Config;
 use crate::domain::time::format_short;
@@ -53,9 +55,18 @@ enum Command {
     /// Discover hosts on a local segment.
     Discover(DiscoverArgs),
     /// List known devices from the database.
-    Devices,
+    Devices(DevicesArgs),
     /// Show one device with identifiers, evidence, and inferences.
     Device {
+        /// Device UUID.
+        id: String,
+    },
+    /// Show a logical segment map derived from recorded IP prefixes.
+    Map(MapArgs),
+    /// Show changes between a scan and the previous comparable scan.
+    Changes(ChangesArgs),
+    /// Show one device's per-session inventory history.
+    History {
         /// Device UUID.
         id: String,
     },
@@ -110,6 +121,36 @@ struct DiscoverArgs {
     /// mDNS browse window in milliseconds.
     #[arg(long, value_name = "MS")]
     mdns_window_ms: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct DevicesArgs {
+    /// Case-insensitive substring search over addresses, names, and inferences.
+    #[arg(long, value_name = "TEXT")]
+    search: Option<String>,
+    /// Restrict to devices whose most recent address is inside this prefix.
+    #[arg(long, value_name = "CIDR")]
+    segment: Option<String>,
+    /// Show only devices older than the freshness threshold.
+    #[arg(long)]
+    stale: bool,
+    /// Override the stale threshold in milliseconds.
+    #[arg(long, value_name = "MS")]
+    stale_after_ms: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct MapArgs {
+    /// Restrict the map to one interface.
+    #[arg(short, long)]
+    interface: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ChangesArgs {
+    /// Compare this session instead of the latest one.
+    #[arg(long, value_name = "UUID")]
+    session: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,11 +239,19 @@ async fn execute(cli: Cli) -> Result<i32> {
             let cancel = CancellationToken::new();
             install_cancel_handler(&cancel);
             let scan = discovery::run_scan(&mut store, options, cancel).await?;
+            let changes = inventory::changes_for_session(&store, Some(scan.session_id))?;
 
             if json_output {
-                print_json(&with_schema(&scan))?;
+                let mut value = with_schema(&scan);
+                if let Value::Object(map) = &mut value {
+                    map.insert("changes".to_string(), serde_json::to_value(&changes)?);
+                }
+                print_json(&value)?;
             } else {
                 print_scan(&scan);
+                if let Some(report) = &changes {
+                    print_change_summary(report);
+                }
             }
             Ok(match scan.status {
                 SessionStatus::Partial | SessionStatus::Cancelled => EXIT_PARTIAL,
@@ -210,16 +259,115 @@ async fn execute(cli: Cli) -> Result<i32> {
                 _ => EXIT_OK,
             })
         }
-        Command::Devices => {
+        Command::Devices(args) => {
             let store = Store::open(&config.db_path)?;
-            let devices = store.list_devices(None)?;
+            let mut filter = DeviceFilter {
+                search: args.search,
+                ..DeviceFilter::default()
+            };
+            if let Some(segment) = args.segment {
+                match segment.parse::<IpNet>() {
+                    Ok(prefix) => filter.segment = Some(prefix),
+                    Err(error) => {
+                        eprintln!("error: {segment:?} is not a valid CIDR prefix: {error}");
+                        return Ok(EXIT_USAGE);
+                    }
+                }
+            }
+            if let Some(stale_after_ms) = args.stale_after_ms {
+                if stale_after_ms <= 0 {
+                    eprintln!("error: --stale-after-ms must be greater than zero");
+                    return Ok(EXIT_USAGE);
+                }
+                filter.stale_after_ms = stale_after_ms;
+            }
+            filter.stale_only = args.stale;
+
+            let now = crate::domain::time::now_ms();
+            let devices = inventory::list_devices(&store, &filter, now)?;
             if json_output {
                 print_json(&json!({
                     "schema_version": SCHEMA_VERSION,
                     "devices": devices,
+                    "filter": {
+                        "search": filter.search,
+                        "segment": filter.segment.map(|prefix| prefix.to_string()),
+                        "stale_only": filter.stale_only,
+                        "stale_after_ms": filter.stale_after_ms,
+                    }
                 }))?;
             } else {
-                print_devices(&devices);
+                print_devices(&devices, filter.is_active());
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Map(args) => {
+            let store = Store::open(&config.db_path)?;
+            let map = inventory::build_map(
+                &store,
+                args.interface.as_deref(),
+                crate::domain::time::now_ms(),
+            )?;
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "map": map,
+                }))?;
+            } else {
+                print_map(&map);
+            }
+            Ok(EXIT_OK)
+        }
+        Command::Changes(args) => {
+            let store = Store::open(&config.db_path)?;
+            let session_id = match args.session {
+                Some(value) => match Uuid::parse_str(&value) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        eprintln!("error: {value:?} is not a valid session UUID");
+                        return Ok(EXIT_USAGE);
+                    }
+                },
+                None => None,
+            };
+            let report = inventory::changes_for_session(&store, session_id)?;
+            if session_id.is_some() && report.is_none() {
+                eprintln!("session {} was not found", session_id.unwrap_or_default());
+                return Ok(EXIT_NOT_FOUND);
+            }
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "changes": report,
+                    "note": report.is_none().then_some(
+                        "No scan sessions have been recorded yet. Run `netatlas discover` first."
+                    ),
+                }))?;
+            } else if let Some(report) = &report {
+                print_changes(report);
+            } else {
+                println!("No scan sessions have been recorded yet. Run `netatlas discover` first.");
+            }
+            Ok(EXIT_OK)
+        }
+        Command::History { id } => {
+            let Ok(id) = Uuid::parse_str(&id) else {
+                eprintln!("error: {id:?} is not a valid device UUID");
+                return Ok(EXIT_USAGE);
+            };
+            let store = Store::open(&config.db_path)?;
+            let history = inventory::device_history(&store, id, crate::domain::time::now_ms())?;
+            let Some(history) = history else {
+                eprintln!("device {id} was not found");
+                return Ok(EXIT_NOT_FOUND);
+            };
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "history": history,
+                }))?;
+            } else {
+                print_history(&history);
             }
             Ok(EXIT_OK)
         }
@@ -579,9 +727,13 @@ fn inference_value(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn print_devices(devices: &[DeviceSummary]) {
+fn print_devices(devices: &[DeviceSummary], filtered: bool) {
     if devices.is_empty() {
-        println!("No devices have been recorded yet. Run `netatlas discover` first.");
+        if filtered {
+            println!("No devices matched the filter.");
+        } else {
+            println!("No devices have been recorded yet. Run `netatlas discover` first.");
+        }
         return;
     }
     let mut rows = Vec::new();
@@ -593,6 +745,7 @@ fn print_devices(devices: &[DeviceSummary]) {
             device.manufacturer.display_value(),
             join_or_dash(&device.hostnames),
             format_short(device.last_seen_ms),
+            format_freshness(device.freshness),
         ]);
     }
     print_table(
@@ -603,9 +756,291 @@ fn print_devices(devices: &[DeviceSummary]) {
             "MANUFACTURER",
             "HOSTNAMES",
             "LAST SEEN",
+            "FRESHNESS",
         ],
         rows,
     );
+    if devices.iter().any(|device| device.freshness.is_stale()) {
+        println!(
+            "\nStale records have not been observed recently. Staleness is not proof that a device is offline."
+        );
+    }
+}
+
+fn print_map(map: &SegmentMap) {
+    if map.segments.is_empty() && map.unassigned.is_empty() {
+        println!("No inventory has been recorded yet. Run `netatlas discover` first.");
+        return;
+    }
+
+    for segment in &map.segments {
+        println!(
+            "Segment {}  interface {}  gateway {}  last seen {}  ({})",
+            segment.prefix,
+            segment.interface,
+            segment
+                .gateway
+                .map(|gateway| gateway.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            format_short(segment.last_seen_ms),
+            format_freshness(segment.freshness)
+        );
+        if segment.devices.is_empty() {
+            println!("  No devices are currently associated with this prefix.\n");
+            continue;
+        }
+        let rows = segment
+            .devices
+            .iter()
+            .map(device_map_row)
+            .collect::<Vec<_>>();
+        print_table(
+            &[
+                "ID",
+                "ADDRESS",
+                "MAC",
+                "MANUFACTURER",
+                "CATEGORY",
+                "HOSTNAMES",
+                "LAST SEEN",
+                "FRESHNESS",
+            ],
+            rows,
+        );
+        println!();
+    }
+
+    if !map.unassigned.is_empty() {
+        println!("Unassigned devices (most recent address does not match a recorded segment):");
+        let rows = map
+            .unassigned
+            .iter()
+            .map(device_map_row)
+            .collect::<Vec<_>>();
+        print_table(
+            &[
+                "ID",
+                "ADDRESS",
+                "MAC",
+                "MANUFACTURER",
+                "CATEGORY",
+                "HOSTNAMES",
+                "LAST SEEN",
+                "FRESHNESS",
+            ],
+            rows,
+        );
+        println!();
+    }
+
+    println!("{}", map.note);
+}
+
+fn device_map_row(device: &DeviceSummary) -> Vec<String> {
+    vec![
+        short_id(device.id),
+        device
+            .ips
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "-".to_string()),
+        device
+            .macs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "-".to_string()),
+        device.manufacturer.display_value(),
+        device.category.display_value(),
+        join_or_dash(&device.hostnames),
+        format_short(device.last_seen_ms),
+        format_freshness(device.freshness),
+    ]
+}
+
+fn print_changes(report: &ChangeReport) {
+    println!(
+        "Scan {} {}",
+        short_id(report.current.id),
+        report.current.status.as_str()
+    );
+    println!(
+        "Scope: interface {}  target {}",
+        report.current.scope.interface.as_deref().unwrap_or("-"),
+        report.current.scope.target.as_deref().unwrap_or("-")
+    );
+    if let Some(previous) = &report.previous {
+        println!(
+            "Compared with scan {} ({} device(s))",
+            short_id(previous.id),
+            previous.device_count
+        );
+    }
+    if let Some(note) = &report.note {
+        println!("{note}");
+    }
+    if !report.comparable {
+        return;
+    }
+    if report.events.is_empty() {
+        println!("\nNo changes were detected between the comparable scans.");
+        return;
+    }
+
+    let rows = report
+        .events
+        .iter()
+        .map(|event| {
+            vec![
+                short_id(event.device_id),
+                event.kind.as_str().to_string(),
+                event.summary.clone(),
+                format_short(event.observed_at_ms),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!();
+    print_table(&["DEVICE", "CHANGE", "SUMMARY", "OBSERVED"], rows);
+    println!(
+        "\n'not_observed' means the device was absent from this scan, not that it is offline."
+    );
+}
+
+fn print_change_summary(report: &ChangeReport) {
+    println!("\nChanges since the previous comparable scan:");
+    if let Some(note) = &report.note {
+        println!("  {note}");
+    }
+    if !report.comparable {
+        return;
+    }
+    if report.events.is_empty() {
+        println!("  No changes detected.");
+        return;
+    }
+    for event in &report.events {
+        println!(
+            "  {:<16} {}  {}",
+            event.kind.as_str(),
+            short_id(event.device_id),
+            event.summary
+        );
+    }
+}
+
+fn print_history(history: &DeviceHistory) {
+    let summary = &history.summary;
+    println!(
+        "Device {}  {}",
+        summary.id,
+        summary.label.as_deref().unwrap_or("(no label)")
+    );
+    println!(
+        "First seen {}  last seen {}  ({})",
+        format_short(summary.first_seen_ms),
+        format_short(summary.last_seen_ms),
+        format_freshness(summary.freshness)
+    );
+    println!("Addresses: {}", join_or_dash(&summary.ips));
+    println!("MACs:      {}", join_or_dash(&summary.macs));
+    println!("Hostnames: {}", join_or_dash(&summary.hostnames));
+
+    if !history.sessions.is_empty() {
+        println!("\nRecorded sessions:");
+        let rows = history
+            .sessions
+            .iter()
+            .map(|entry| {
+                vec![
+                    short_id(entry.session.id),
+                    format_short(entry.session.started_at_ms),
+                    entry.session.status.as_str().to_string(),
+                    join_or_dash(&entry.snapshot.ips),
+                    join_or_dash(&entry.snapshot.macs),
+                    join_or_dash(&entry.snapshot.hostnames),
+                    snapshot_inference(&entry.snapshot, Property::Manufacturer),
+                    snapshot_inference(&entry.snapshot, Property::Category),
+                    snapshot_inference(&entry.snapshot, Property::Os),
+                    snapshot_inference(&entry.snapshot, Property::Model),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(
+            &[
+                "SESSION",
+                "STARTED",
+                "STATUS",
+                "ADDRESSES",
+                "MACS",
+                "HOSTNAMES",
+                "MANUFACTURER",
+                "CATEGORY",
+                "OS",
+                "MODEL",
+            ],
+            rows,
+        );
+    }
+
+    if !history.changes.is_empty() {
+        println!("\nChanges between recorded sessions:");
+        let rows = history
+            .changes
+            .iter()
+            .map(|event| {
+                vec![
+                    short_id(event.session_id),
+                    event.kind.as_str().to_string(),
+                    event.summary.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["SESSION", "CHANGE", "SUMMARY"], rows);
+    }
+
+    if let Some(note) = &history.note {
+        println!("\n{note}");
+    }
+}
+
+fn snapshot_inference(
+    snapshot: &crate::domain::DeviceSessionSnapshot,
+    property: Property,
+) -> String {
+    snapshot
+        .inferences
+        .iter()
+        .find(|inference| inference.property == property)
+        .map(
+            |inference| match (inference.status, &inference.value, inference.unknown_reason) {
+                (crate::domain::InferenceStatus::Conflicted, _, _) => "conflicted".to_string(),
+                (_, Some(Value::String(value)), _) => value.clone(),
+                (_, Some(value), _) => value.to_string(),
+                (_, None, Some(reason)) => format!("unknown ({})", reason.as_str()),
+                (_, None, None) => "unknown".to_string(),
+            },
+        )
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_freshness(freshness: crate::domain::Freshness) -> String {
+    format!(
+        "{} ({})",
+        freshness.state.as_str(),
+        format_age(freshness.age_ms)
+    )
+}
+
+fn format_age(ms: i64) -> String {
+    let seconds = ms.max(0) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
 }
 
 fn print_device(detail: &DeviceDetail) {
@@ -616,9 +1051,10 @@ fn print_device(detail: &DeviceDetail) {
         summary.label.as_deref().unwrap_or("(no label)")
     );
     println!(
-        "First seen {}  last seen {}",
+        "First seen {}  last seen {}  ({})",
         format_short(summary.first_seen_ms),
-        format_short(summary.last_seen_ms)
+        format_short(summary.last_seen_ms),
+        format_freshness(summary.freshness)
     );
     println!("Addresses: {}", join_or_dash(&summary.ips));
     println!("MACs:      {}", join_or_dash(&summary.macs));

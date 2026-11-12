@@ -11,10 +11,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::application::model::{ExistingDevice, ScanResult};
+use crate::application::model::{
+    DeviceHistoryEntry, ExistingDevice, ScanResult, SegmentRecord, SessionRecord, SessionStatus,
+};
 use crate::domain::{
-    Confidence, DeviceDetail, DeviceSummary, EvidenceRecord, IdentifierKind, IdentifierRecord,
-    IdentityLink, InferenceRecord, InferenceStatus, InferenceView, MacAddress, ObservationRecord,
+    Confidence, DEFAULT_STALE_AFTER_MS, DeviceDetail, DeviceSessionSnapshot, DeviceSummary,
+    EvidenceRecord, Freshness, IdentifierKind, IdentifierRecord, IdentityLink, InferenceRecord,
+    InferenceSnapshot, InferenceStatus, InferenceView, MacAddress, ObservationRecord,
     ServiceRecord, UnknownReason, ids::new_id, time::now_ms,
 };
 use crate::infrastructure::oui::{self, OuiEntry, OuiError, OuiParseResult, OuiSourceMeta};
@@ -372,6 +375,7 @@ impl Store {
         for inference in &scan.inferences {
             Self::insert_inference(&transaction, inference)?;
         }
+        Self::insert_device_sessions(&transaction, scan)?;
         for link in &scan.identity_links {
             transaction.execute(
                 "INSERT OR IGNORE INTO identity_links
@@ -695,7 +699,75 @@ impl Store {
         Ok(())
     }
 
+    fn insert_device_sessions(
+        transaction: &Transaction<'_>,
+        scan: &ScanResult,
+    ) -> Result<(), StorageError> {
+        for device in &scan.devices {
+            let mut ips = Vec::new();
+            let mut macs = Vec::new();
+            let mut hostnames = Vec::new();
+            for identifier in &device.identifiers {
+                match identifier.kind {
+                    IdentifierKind::Ip => ips.push(identifier.value.clone()),
+                    IdentifierKind::Mac => macs.push(identifier.value.clone()),
+                    IdentifierKind::Hostname | IdentifierKind::DnsName => {
+                        hostnames.push(identifier.value.clone());
+                    }
+                    _ => {}
+                }
+            }
+            ips.sort();
+            ips.dedup();
+            macs.sort();
+            macs.dedup();
+            hostnames.sort();
+            hostnames.dedup();
+
+            let mut inferences: Vec<InferenceSnapshot> = scan
+                .inferences
+                .iter()
+                .filter(|inference| inference.device_id == device.id)
+                .map(InferenceSnapshot::from)
+                .collect();
+            inferences.sort_by_key(|inference| inference.property.as_str());
+
+            transaction.execute(
+                "INSERT INTO device_sessions
+                 (session_id, device_id, first_seen_ms, last_seen_ms,
+                  ips_json, macs_json, hostnames_json, inferences_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(session_id, device_id) DO UPDATE SET
+                    first_seen_ms = excluded.first_seen_ms,
+                    last_seen_ms = excluded.last_seen_ms,
+                    ips_json = excluded.ips_json,
+                    macs_json = excluded.macs_json,
+                    hostnames_json = excluded.hostnames_json,
+                    inferences_json = excluded.inferences_json",
+                params![
+                    scan.session_id.to_string(),
+                    device.id.to_string(),
+                    device.first_seen_ms,
+                    device.last_seen_ms,
+                    json_string(&ips),
+                    json_string(&macs),
+                    json_string(&hostnames),
+                    json_string(&inferences),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn list_devices(&self, session: Option<Uuid>) -> Result<Vec<DeviceSummary>, StorageError> {
+        self.list_devices_at(session, now_ms())
+    }
+
+    pub fn list_devices_at(
+        &self,
+        session: Option<Uuid>,
+        now_ms: i64,
+    ) -> Result<Vec<DeviceSummary>, StorageError> {
         let session_devices: Option<HashSet<String>> = match session {
             Some(session_id) => {
                 let mut statement = self.connection.prepare(
@@ -726,7 +798,7 @@ impl Store {
             {
                 continue;
             }
-            if let Some(summary) = self.load_summary(&id)? {
+            if let Some(summary) = self.load_summary(&id, now_ms)? {
                 summaries.push(summary);
             }
         }
@@ -747,7 +819,11 @@ impl Store {
         Ok(summaries)
     }
 
-    fn load_summary(&self, device_id: &str) -> Result<Option<DeviceSummary>, StorageError> {
+    fn load_summary(
+        &self,
+        device_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<DeviceSummary>, StorageError> {
         let device = self
             .connection
             .query_row(
@@ -874,6 +950,7 @@ impl Store {
             first_seen_ms,
             last_seen_ms,
             last_session_id: last_session_id.and_then(|value| Uuid::parse_str(&value).ok()),
+            freshness: Freshness::new(last_seen_ms, now_ms, DEFAULT_STALE_AFTER_MS),
         }))
     }
 
@@ -918,7 +995,7 @@ impl Store {
 
     pub fn get_device(&self, id: Uuid) -> Result<Option<DeviceDetail>, StorageError> {
         let device_id = id.to_string();
-        let Some(summary) = self.load_summary(&device_id)? else {
+        let Some(summary) = self.load_summary(&device_id, now_ms())? else {
             return Ok(None);
         };
 
@@ -938,6 +1015,139 @@ impl Store {
             links,
             services,
         }))
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.scope_json, s.methods_json, s.started_at_ms, s.finished_at_ms,
+                    s.status, s.errors_json,
+                    (SELECT COUNT(*) FROM device_sessions ds WHERE ds.session_id = s.id)
+             FROM scan_sessions s
+             ORDER BY s.started_at_ms DESC, s.id DESC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next()? {
+            sessions.push(session_from_row(row, 0)?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn latest_session(&self) -> Result<Option<SessionRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.scope_json, s.methods_json, s.started_at_ms, s.finished_at_ms,
+                    s.status, s.errors_json,
+                    (SELECT COUNT(*) FROM device_sessions ds WHERE ds.session_id = s.id)
+             FROM scan_sessions s
+             ORDER BY s.started_at_ms DESC, s.id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = statement.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(session_from_row(row, 0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_session(&self, id: Uuid) -> Result<Option<SessionRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.scope_json, s.methods_json, s.started_at_ms, s.finished_at_ms,
+                    s.status, s.errors_json,
+                    (SELECT COUNT(*) FROM device_sessions ds WHERE ds.session_id = s.id)
+             FROM scan_sessions s
+             WHERE s.id = ?1",
+        )?;
+        let mut rows = statement.query(params![id.to_string()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(session_from_row(row, 0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_session_snapshots(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<DeviceSessionSnapshot>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT session_id, device_id, first_seen_ms, last_seen_ms,
+                    ips_json, macs_json, hostnames_json, inferences_json
+             FROM device_sessions
+             WHERE session_id = ?1
+             ORDER BY device_id",
+        )?;
+        let mut rows = statement.query(params![session_id.to_string()])?;
+        let mut snapshots = Vec::new();
+        while let Some(row) = rows.next()? {
+            snapshots.push(snapshot_from_row(row, 0)?);
+        }
+        Ok(snapshots)
+    }
+
+    pub fn load_device_history(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Vec<DeviceHistoryEntry>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ds.session_id, ds.device_id, ds.first_seen_ms, ds.last_seen_ms,
+                    ds.ips_json, ds.macs_json, ds.hostnames_json, ds.inferences_json,
+                    s.id, s.scope_json, s.methods_json, s.started_at_ms, s.finished_at_ms,
+                    s.status, s.errors_json,
+                    (SELECT COUNT(*) FROM device_sessions x WHERE x.session_id = s.id)
+             FROM device_sessions ds
+             JOIN scan_sessions s ON s.id = ds.session_id
+             WHERE ds.device_id = ?1
+             ORDER BY s.started_at_ms ASC, s.id ASC",
+        )?;
+        let mut rows = statement.query(params![device_id.to_string()])?;
+        let mut history = Vec::new();
+        while let Some(row) = rows.next()? {
+            history.push(DeviceHistoryEntry {
+                snapshot: snapshot_from_row(row, 0)?,
+                session: session_from_row(row, 8)?,
+            });
+        }
+        Ok(history)
+    }
+
+    pub fn list_segments(&self) -> Result<Vec<SegmentRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ns.id, i.name, ns.prefix, ns.gateway, ns.first_seen_ms, ns.last_seen_ms
+             FROM network_segments ns
+             JOIN interfaces i ON i.id = ns.interface_id
+             ORDER BY i.name, ns.prefix",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut segments = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let interface: String = row.get(1)?;
+            let prefix: String = row.get(2)?;
+            let gateway: Option<String> = row.get(3)?;
+            segments.push(SegmentRecord {
+                id: Uuid::parse_str(&id).unwrap_or_default(),
+                interface,
+                prefix: prefix
+                    .parse::<ipnet::IpNet>()
+                    .map(|prefix| prefix.trunc())
+                    .map_err(|error| {
+                        StorageError::InvalidValue(format!(
+                            "invalid stored segment prefix {prefix:?}: {error}"
+                        ))
+                    })?,
+                gateway: gateway
+                    .map(|value| {
+                        value.parse().map_err(|error| {
+                            StorageError::InvalidValue(format!(
+                                "invalid stored segment gateway {value:?}: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()?,
+                first_seen_ms: row.get(4)?,
+                last_seen_ms: row.get(5)?,
+            });
+        }
+        Ok(segments)
     }
 
     fn load_evidence(&self, device_id: &str) -> Result<Vec<EvidenceRecord>, StorageError> {
@@ -1151,6 +1361,56 @@ impl Store {
     }
 }
 
+fn session_from_row(row: &rusqlite::Row<'_>, offset: usize) -> Result<SessionRecord, StorageError> {
+    let id: String = row.get(offset)?;
+    let scope_json: String = row.get(offset + 1)?;
+    let methods_json: String = row.get(offset + 2)?;
+    let status_value: String = row.get(offset + 5)?;
+    let errors_json: String = row.get(offset + 6)?;
+    let device_count: i64 = row.get(offset + 7)?;
+
+    Ok(SessionRecord {
+        id: Uuid::parse_str(&id).unwrap_or_default(),
+        scope: parse_json(&scope_json, "scan scope")?,
+        methods: parse_json(&methods_json, "scan methods")?,
+        started_at_ms: row.get(offset + 3)?,
+        finished_at_ms: row.get(offset + 4)?,
+        status: SessionStatus::from_db(&status_value).ok_or_else(|| {
+            StorageError::InvalidValue(format!("invalid stored session status {status_value:?}"))
+        })?,
+        errors: parse_json(&errors_json, "scan errors")?,
+        device_count: device_count.max(0) as usize,
+    })
+}
+
+fn snapshot_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> Result<DeviceSessionSnapshot, StorageError> {
+    let session_id: String = row.get(offset)?;
+    let device_id: String = row.get(offset + 1)?;
+    let ips_json: String = row.get(offset + 4)?;
+    let macs_json: String = row.get(offset + 5)?;
+    let hostnames_json: String = row.get(offset + 6)?;
+    let inferences_json: String = row.get(offset + 7)?;
+
+    Ok(DeviceSessionSnapshot {
+        session_id: Uuid::parse_str(&session_id).unwrap_or_default(),
+        device_id: Uuid::parse_str(&device_id).unwrap_or_default(),
+        first_seen_ms: row.get(offset + 2)?,
+        last_seen_ms: row.get(offset + 3)?,
+        ips: parse_json(&ips_json, "snapshot addresses")?,
+        macs: parse_json(&macs_json, "snapshot MAC addresses")?,
+        hostnames: parse_json(&hostnames_json, "snapshot hostnames")?,
+        inferences: parse_json(&inferences_json, "snapshot inferences")?,
+    })
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(value: &str, label: &str) -> Result<T, StorageError> {
+    serde_json::from_str(value)
+        .map_err(|error| StorageError::InvalidValue(format!("invalid stored {label}: {error}")))
+}
+
 fn default_inference_view(property: &str) -> InferenceView {
     InferenceView {
         value: None,
@@ -1267,7 +1527,7 @@ mod tests {
         let device_id = scan.devices[0].id;
         store.save_scan(&scan).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
 
         let devices = store.list_devices(None).unwrap();
         assert_eq!(devices.len(), 1);
@@ -1293,6 +1553,32 @@ mod tests {
         assert_eq!(detail.inferences.len(), 4);
         assert!(!detail.observations.is_empty());
         assert_eq!(detail.summary.last_session_id, Some(scan.session_id));
+    }
+
+    #[test]
+    fn inventory_snapshots_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        let scan = sample_scan();
+        let device_id = scan.devices[0].id;
+        store.save_scan(&scan).unwrap();
+
+        let snapshots = store.load_session_snapshots(scan.session_id).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.device_id, device_id);
+        assert!(snapshot.ips.contains(&"192.168.1.10".to_string()));
+        assert!(snapshot.macs.contains(&"00:11:22:33:44:55".to_string()));
+        assert_eq!(snapshot.inferences.len(), 4);
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, scan.session_id);
+        assert_eq!(sessions[0].device_count, 1);
+        assert_eq!(store.latest_session().unwrap().unwrap().id, scan.session_id);
+
+        let history = store.load_device_history(device_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].session.id, scan.session_id);
     }
 
     #[test]

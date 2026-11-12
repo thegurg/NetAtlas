@@ -1,7 +1,8 @@
 # NetAtlas architecture
 
-Status: Phase 2 implemented (identification providers and evidence fusion). Later-phase
-modules are described where they affect the current boundaries, but they do not exist yet.
+Status: Phase 3 implemented (inventory snapshots, history, change detection, segment
+grouping, filtering, and freshness). Later-phase modules are described where they affect
+the current boundaries, but they do not exist yet.
 
 ## 1. Goals and non-goals
 
@@ -83,13 +84,15 @@ src/
     service.rs            transport and persisted service records
     evidence.rs           evidence, properties, source units
     inference.rs          candidate conclusions, conflicts, unknown reasons
+    inventory.rs          snapshots, freshness, change detection
     confidence.rs         confidence enum and aggregation rubric
     error.rs              domain errors
   application/
-    model.rs              scan/session result types
+    model.rs              scan/session result and inventory row types
     discovery.rs          scope resolution, provider scheduling, persistence
     identity.rs           identity resolution v1
     identify.rs           evidence extraction and inference
+    inventory.rs          filtering, segment map, history, change reports
   infrastructure/
     netlink.rs            links, addresses, routes, neighbour table
     icmp.rs               ICMP echo provider (surge-ping)
@@ -104,9 +107,9 @@ src/
   cli/                    clap definitions, handlers, table/JSON output
 ```
 
-Planned later modules: `application/inventory.rs`, `application/dns.rs`,
-`application/route.rs`, `application/monitor.rs`, `application/export.rs`, and `tui/`.
-They are not created as empty placeholders.
+Planned later modules: `application/dns.rs`, `application/route.rs`,
+`application/monitor.rs`, `application/export.rs`, and `tui/`. They are not created as
+empty placeholders.
 
 Feature modules (`discovery`, `identification`, `lan`, `dns`, `route`, `monitoring`)
 are realized as application services plus infrastructure adapters, not as separate
@@ -114,7 +117,7 @@ applications. Names may evolve; the layer boundaries may not.
 
 ## 4. Data flow
 
-### Discovery and identification
+### Discovery, identification, and inventory
 
 ```
 network context (netlink)
@@ -124,8 +127,8 @@ scan session scope: interface and/or target prefix, methods, limits
         |
         v
 providers run concurrently, each emitting normalized observations
-  Phase 2: neighbour table | ICMP echo | TCP connect | reverse DNS
-           mDNS | SSDP/UPnP | NetBIOS | service banners
+  providers: neighbour table | ICMP echo | TCP connect | reverse DNS
+             mDNS | SSDP/UPnP | NetBIOS | service banners
         |
         v
 observation stream (facts only, with source, method, timestamp, details)
@@ -140,7 +143,10 @@ evidence extraction: each observation may support a property candidate
 inference: aggregate independent evidence, detect conflicts, assign confidence
         |
         v
-persist session + observations + evidence + inferences in transactions
+persist session + observations + evidence + inferences + inventory snapshots
+        |
+        v
+inventory: filter devices, group by segment, compare snapshots, mark freshness
         |
         v
 CLI table/JSON or TUI views (both read the same application services)
@@ -155,10 +161,10 @@ DNS and route measurements follow the same shape: a measurement is recorded with
 method, target, resolver/probe parameters, timing, and result. Comparison is a pure
 domain operation over stored measurements.
 
-## 5. Provider contract in Phase 2
+## 5. Provider contract
 
-Phase 2 still uses concrete adapters with narrow async functions rather than a
-dyn-compatible trait:
+The current implementation still uses concrete adapters with narrow async functions
+rather than a dyn-compatible trait:
 
 ```rust
 icmp::sweep(&addresses, timeout, concurrency, &cancel).await
@@ -258,9 +264,13 @@ reports carry typed errors, so automation can distinguish complete from partial 
 - Observation history is append-oriented. Current device profiles are derived from
   identifiers and the latest inference per property.
 - One scan writes its session, devices, identifiers, observations, evidence,
-  inferences, identity links, and service observations in one transaction. A failure
-  rolls the whole scan back. A crash can leave a `running` session; finalizing it as
-  `interrupted` on next startup is not implemented yet.
+  inferences, per-device inventory snapshots, identity links, and service observations
+  in one transaction. A failure rolls the whole scan back. A crash can leave a `running`
+  session; finalizing it as `interrupted` on next startup is not implemented yet.
+- Inventory snapshots are compact derived records for history and change detection. The
+  raw observation/evidence tables remain the provenance source; snapshots do not replace
+  them. Change events are derived from two snapshots on read, so no separate event table
+  is required in Phase 3.
 - The `services` table stores mDNS, UPnP, and TCP banner observations. It is the same
   service inventory surfaced by `discover` and `device`; it is not a second, unrelated
   data path.

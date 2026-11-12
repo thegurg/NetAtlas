@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
-    Confidence, EvidenceRecord, InferenceStatus, ObservationRecord, Source, UnknownReason,
+    Confidence, EvidenceRecord, Freshness, InferenceStatus, ObservationRecord, Source,
+    UnknownReason,
 };
 
 /// A kind of identifier attached to a logical device.
@@ -162,6 +163,8 @@ pub struct DeviceSummary {
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
     pub last_session_id: Option<Uuid>,
+    /// Whether the record is older than the inventory freshness threshold.
+    pub freshness: Freshness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

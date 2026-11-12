@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::domain::{Confidence, Source};
 
 /// A device property that can be inferred from evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Property {
     Manufacturer,

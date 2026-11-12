@@ -8,6 +8,7 @@ pub mod error;
 pub mod evidence;
 pub mod ids;
 pub mod inference;
+pub mod inventory;
 pub mod network;
 pub mod observation;
 pub mod service;
@@ -21,6 +22,10 @@ pub use device::{
 pub use error::DomainError;
 pub use evidence::{EvidenceRecord, Property};
 pub use inference::{InferenceRecord, InferenceStatus, UnknownReason};
+pub use inventory::{
+    ChangeContext, ChangeKind, DEFAULT_STALE_AFTER_MS, DeviceChange, DeviceSessionSnapshot,
+    Freshness, FreshnessState, InferenceSnapshot, detect_changes,
+};
 pub use network::{
     InterfaceAddress, InterfaceInfo, MacAddress, NeighborEntry, NeighborState, NetworkContext,
     NetworkSegment, RouteInfo,

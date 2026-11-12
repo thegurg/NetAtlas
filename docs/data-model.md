@@ -1,8 +1,9 @@
 # NetAtlas data model
 
-Status: Phase 2. Migration `0001_discovery` is implemented and applied automatically.
-Phase 2 uses the existing `services` table; no new migration was required. Later DNS,
-route, and monitoring tables do not exist yet.
+Status: Phase 3. Migrations `0001_discovery` and `0002_inventory` are implemented and
+applied automatically. Phase 2 used the existing `services` table; Phase 3 adds
+per-session inventory snapshots. Later DNS, route, and monitoring tables do not exist
+yet.
 
 ## 1. Modeling principles
 
@@ -136,6 +137,25 @@ pub enum ProtocolObservation {
     Netbios(NetbiosObservation),
     Service(ServiceObservation),
 }
+
+pub struct DeviceSessionSnapshot {
+    pub session_id: SessionId,
+    pub device_id: DeviceId,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub ips: Vec<String>,
+    pub macs: Vec<String>,
+    pub hostnames: Vec<String>,
+    pub inferences: Vec<InferenceSnapshot>,
+}
+
+pub struct InferenceSnapshot {
+    pub property: Property,
+    pub value: Option<serde_json::Value>,
+    pub confidence: Confidence,
+    pub status: InferenceStatus,
+    pub unknown_reason: Option<UnknownReason>,
+}
 ```
 
 A `HostProbe` carries an optional `protocol` payload. mDNS, UPnP, NetBIOS, and service
@@ -239,6 +259,28 @@ pub struct IdentityLink {
 
 Links are never destructive. Rejecting a link preserves both device histories.
 
+### 3.5 Inventory snapshots and change events
+
+A `DeviceSessionSnapshot` is a compact, derived record of what one scan observed for one
+logical device. It stores addresses, MACs, hostnames, and the four inferred properties.
+It does not replace observations, evidence, or inference history.
+
+Change events are derived views over two snapshots, not independent truth:
+
+- `new_device`: present in the current snapshot, absent from the compared earlier one.
+- `not_observed`: present earlier, absent now. This is not an offline determination.
+- `ip_changed`, `mac_changed`, `hostname_changed`: the observed set changed.
+- `inference_changed`: a property value, status, unknown reason, or confidence changed.
+
+Comparison requires the same interface and target and two `completed` or `partial`
+sessions. A partial session can hide devices because a provider failed; reports carry a
+caveat. Snapshots start with migration `0002_inventory`, so earlier sessions cannot be
+compared even though their raw observations remain available.
+
+Freshness is a display threshold (default 24 hours for inventory), not an offline test.
+Segment grouping uses the most recent address per device and recorded IP prefixes; it is
+logical inventory, not physical topology.
+
 ## 4. Evidence and confidence
 
 ### 4.1 Evidence unit
@@ -326,9 +368,10 @@ Inference (conclusion):
 
 ## 5. SQLite schema
 
-Migration `0001_discovery.sql` (Phase 1) is unchanged in Phase 2. Phase 2 writes
-mDNS/UPnP/banner observations into the existing `services` table. DNS, route, and
-monitoring tables are added by later migrations.
+Migration `0001_discovery.sql` (Phase 1) is unchanged. Phase 2 writes mDNS/UPnP/banner
+observations into the existing `services` table. Migration `0002_inventory.sql` adds
+`device_sessions` for per-session snapshots. DNS, route, and monitoring tables are added
+by later migrations.
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -393,6 +436,20 @@ CREATE TABLE devices (
     last_seen_ms  INTEGER NOT NULL,
     merged_into   TEXT REFERENCES devices(id)
 );
+
+CREATE TABLE device_sessions (
+    session_id      TEXT NOT NULL REFERENCES scan_sessions(id) ON DELETE CASCADE,
+    device_id       TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    first_seen_ms   INTEGER NOT NULL,
+    last_seen_ms    INTEGER NOT NULL,
+    ips_json        TEXT NOT NULL DEFAULT '[]',
+    macs_json       TEXT NOT NULL DEFAULT '[]',
+    hostnames_json  TEXT NOT NULL DEFAULT '[]',
+    inferences_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (session_id, device_id)
+);
+CREATE INDEX idx_device_sessions_device ON device_sessions(device_id, session_id);
+CREATE INDEX idx_device_sessions_session ON device_sessions(session_id);
 
 CREATE TABLE device_identifiers (
     id            TEXT PRIMARY KEY,
@@ -507,16 +564,16 @@ CREATE INDEX idx_oui_lookup ON oui_prefixes(prefix_bits, prefix_hex);
 
 ### Planned later migrations
 
-- `0002_dns.sql`: `dns_measurements`, `dns_records`, `dns_comparisons`, `dns_watches`.
-- `0003_route.sql`: `route_measurements`, `route_hops`, `route_samples`.
-- `0004_monitoring.sql`: `network_events`, `monitor_runs`, `import_reports`.
+- `0003_dns.sql`: `dns_measurements`, `dns_records`, `dns_comparisons`, `dns_watches`.
+- `0004_route.sql`: `route_measurements`, `route_hops`, `route_samples`.
+- `0005_monitoring.sql`: `network_events`, `monitor_runs`, `import_reports`.
 - Import/export metadata tables if needed for provenance.
 
 These are not created until their modules exist.
 
 ## 6. Migrations and integrity
 
-Implemented through Phase 2:
+Implemented through Phase 3:
 
 - Migrations are numbered SQL files embedded in the binary, applied inside a
   transaction, in order. `PRAGMA user_version` records the applied version; a database
@@ -524,8 +581,8 @@ Implemented through Phase 2:
 - A migration failure rolls back that migration and leaves the previous version intact.
 - Foreign keys are enabled on every connection.
 - WAL mode is enabled for concurrent reads while a scan writes.
-- One scan writes its records in one transaction. The writer serializes writes; readers
-  use separate connections.
+- One scan writes its records in one transaction, including its per-device inventory
+  snapshots. The writer serializes writes; readers use separate connections.
 
 Deferred:
 
@@ -558,6 +615,7 @@ Freshness windows used by identification:
 | UPnP UDN / mDNS instance / host key | 30 days |
 | Service banner | 24 hours |
 | mDNS / UPnP description fields | 30 days |
+| Inventory stale display | 24 hours (overridable with `--stale-after-ms`) |
 
 These are defaults, not hard-coded truth; they are recorded in session config so a
 historical inference can be explained.

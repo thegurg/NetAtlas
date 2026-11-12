@@ -26,12 +26,21 @@ fn command() -> (TempDir, Command, PathBuf) {
 }
 
 #[test]
-fn help_lists_phase_one_commands() {
+fn help_lists_available_commands() {
     let (_dir, mut command, _db) = command();
     let output = command.arg("--help").output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in ["interfaces", "discover", "devices", "device", "oui"] {
+    for expected in [
+        "interfaces",
+        "discover",
+        "devices",
+        "device",
+        "map",
+        "changes",
+        "history",
+        "oui",
+    ] {
         assert!(stdout.contains(expected), "help did not mention {expected}");
     }
 }
@@ -131,4 +140,56 @@ fn oui_import_and_lookup_round_trip() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["match"]["organization"], "Example Networks");
+}
+
+#[test]
+fn invalid_segment_filter_is_a_usage_error() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args(["devices", "--segment", "not-a-prefix", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a valid CIDR"));
+}
+
+#[test]
+fn empty_map_returns_empty_groups_as_json() {
+    let (_dir, mut command, _db) = command();
+    let output = command.args(["map", "--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["map"]["segments"], Value::Array(Vec::new()));
+    assert_eq!(value["map"]["unassigned"], Value::Array(Vec::new()));
+    assert!(value["map"]["note"].as_str().unwrap().contains("logical"));
+}
+
+#[test]
+fn changes_without_sessions_is_not_an_error() {
+    let (_dir, mut command, _db) = command();
+    let output = command.args(["changes", "--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["changes"], Value::Null);
+    assert!(value["note"].as_str().unwrap().contains("No scan sessions"));
+}
+
+#[test]
+fn missing_history_device_returns_not_found_exit_code() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args(["history", "00000000-0000-0000-0000-000000000001", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("was not found"));
 }

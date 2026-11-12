@@ -19,11 +19,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_discovery",
-    sql: include_str!("migrations/0001_discovery.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_discovery",
+        sql: include_str!("migrations/0001_discovery.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_inventory",
+        sql: include_str!("migrations/0002_inventory.sql"),
+    },
+];
 
 pub fn supported_version() -> i64 {
     MIGRATIONS.last().map_or(0, |migration| migration.version)
