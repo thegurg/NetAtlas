@@ -1,8 +1,10 @@
 # NetAtlas architecture
 
-Status: Phase 3 implemented (inventory snapshots, history, change detection, segment
-grouping, filtering, and freshness). Later-phase modules are described where they affect
-the current boundaries, but they do not exist yet.
+Status: Phase 4 implemented (inventory snapshots, history, change detection, segment
+grouping, filtering, freshness, raw DNS queries, resolver comparison, and DNS
+measurement history). Cryptographic DNSSEC validation is not implemented. Later-phase
+modules are described where they affect the current boundaries, but they do not exist
+yet.
 
 ## 1. Goals and non-goals
 
@@ -85,6 +87,7 @@ src/
     evidence.rs           evidence, properties, source units
     inference.rs          candidate conclusions, conflicts, unknown reasons
     inventory.rs          snapshots, freshness, change detection
+    dns.rs                DNS queries, response codes, measurements, comparison
     confidence.rs         confidence enum and aggregation rubric
     error.rs              domain errors
   application/
@@ -93,11 +96,13 @@ src/
     identity.rs           identity resolution v1
     identify.rs           evidence extraction and inference
     inventory.rs          filtering, segment map, history, change reports
+    dns.rs                query orchestration, resolver comparison, DNS history
   infrastructure/
     netlink.rs            links, addresses, routes, neighbour table
     icmp.rs               ICMP echo provider (surge-ping)
     tcp_probe.rs          bounded TCP connect fallback
     reverse_dns.rs        PTR lookup through hickory
+    dns.rs                raw UDP/TCP DNS client with RCODE/flags/TTL capture
     mdns.rs               bounded mDNS/DNS-SD browse adapter
     ssdp.rs               SSDP M-SEARCH plus bounded UPnP description fetch
     netbios.rs            wildcard NBSTAT name-table queries
@@ -107,9 +112,8 @@ src/
   cli/                    clap definitions, handlers, table/JSON output
 ```
 
-Planned later modules: `application/dns.rs`, `application/route.rs`,
-`application/monitor.rs`, `application/export.rs`, and `tui/`. They are not created as
-empty placeholders.
+Planned later modules: `application/route.rs`, `application/monitor.rs`,
+`application/export.rs`, and `tui/`. They are not created as empty placeholders.
 
 Feature modules (`discovery`, `identification`, `lan`, `dns`, `route`, `monitoring`)
 are realized as application services plus infrastructure adapters, not as separate
@@ -157,9 +161,17 @@ The identification layer consumes observations and produces explainable candidat
 
 ### DNS and route
 
-DNS and route measurements follow the same shape: a measurement is recorded with its
-method, target, resolver/probe parameters, timing, and result. Comparison is a pure
-domain operation over stored measurements.
+DNS measurements record the query, resolver, transport, timing, attempts, outcome,
+RCODE, flags, TTLs, records, and explicit DNSSEC observation state. The DNS client sends
+raw protocol messages through hickory's protocol types so the reported RCODE, TTLs,
+EDNS presence, AD flag, and RRSIG presence are exactly what the resolver returned. A
+truncated UDP response triggers one bounded TCP retry. Comparison is a pure domain
+operation over stored measurements; it excludes TTL and name case from answer-set
+equality and reports transport failures separately from DNS responses.
+
+No cryptographic DNSSEC validation is performed. The validation state is explicitly
+`not_performed`; AD and RRSIG are observations, not a chain-of-trust result. Route
+measurements are not implemented yet and will follow the same measurement shape.
 
 ## 5. Provider contract
 
@@ -331,15 +343,22 @@ it into SQLite, and records source, version, import time, and content hash.
 OUI lookup is longest-prefix match and is always reported as manufacturer association,
 not model or ownership.
 
-### D7 — DNS through hickory, with explicit validation state
+### D7 — DNS through hickory protocol types, with explicit validation state
 
-Use `hickory-resolver` 0.26 for queries and `Lookup::message()` for RCODE, flags, and
-per-record TTL. Enable `dnssec-ring` and use hickory-proto validation primitives to
-produce an explicit state: `secure`, `insecure`, `bogus`, `indeterminate`, `unsupported`.
-Presence of DNSKEY/DS/RRSIG records is never reported as successful validation.
+Use `hickory-resolver` 0.26 for system resolver configuration and `hickory-proto`
+message/record types, but send raw UDP/TCP exchanges in NetAtlas. This keeps the exact
+RCODE (including EDNS extended codes), header flags, TTLs, EDNS presence, AD flag, and
+RRSIG presence available for each measurement. A truncated UDP response triggers one
+bounded TCP retry.
 
-Phase 2 uses hickory only for reverse-DNS PTR lookups in discovery. The validation
-states belong to the DNS diagnostics phase and are not reported by `discover`.
+The DNSSEC state is explicit. Phase 4 only emits `not_performed` and records the DO bit,
+AD flag, RRSIG presence, and EDNS presence as observations. A future validator may emit
+`secure`, `insecure`, `bogus`, or `indeterminate`; presence of DNSKEY/DS/RRSIG records is
+never reported as successful validation. The `__dnssec` feature is not enabled, so the
+current client cannot validate cryptographically.
+
+Phase 2 uses hickory only for reverse-DNS PTR lookups in discovery. DNS diagnostics are
+a separate application/infrastructure path and do not affect `discover`.
 
 Alternative: a hand-written DNS client. Rejected: too much protocol surface for the value.
 
@@ -448,6 +467,11 @@ small, plain-text only, and does not include TLS handshakes or authentication.
 - The local resolver may cache answers; reverse DNS is a naming hint, not a verified
   identity. DNS diagnostics must record the resolver and cannot claim authoritative
   freshness.
+- DNS measurements are point-in-time results from one resolver. Cached answers and
+  split-horizon DNS can differ legitimately; a match is not proof of correct
+  configuration. Only A, AAAA, CNAME, MX, NS, TXT, and SOA are modelled.
+- DNSSEC validation is not implemented. The AD flag and RRSIG presence are observations,
+  not a local chain-of-trust result.
 - mDNS results depend on multicast reachability and the platform daemon; SSDP depends on
   plain HTTP descriptions being reachable; NetBIOS is often disabled or filtered. A
   provider that ran and found nothing is `no_evidence`, not proof of absence.

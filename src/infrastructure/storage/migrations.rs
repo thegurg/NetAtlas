@@ -30,6 +30,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_inventory",
         sql: include_str!("migrations/0002_inventory.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_dns",
+        sql: include_str!("migrations/0003_dns.sql"),
+    },
 ];
 
 pub fn supported_version() -> i64 {

@@ -16,9 +16,10 @@ use crate::application::model::{
 };
 use crate::domain::{
     Confidence, DEFAULT_STALE_AFTER_MS, DeviceDetail, DeviceSessionSnapshot, DeviceSummary,
-    EvidenceRecord, Freshness, IdentifierKind, IdentifierRecord, IdentityLink, InferenceRecord,
-    InferenceSnapshot, InferenceStatus, InferenceView, MacAddress, ObservationRecord,
-    ServiceRecord, UnknownReason, ids::new_id, time::now_ms,
+    DnsMeasurement, DnsQuery, DnsRecordType, DnsResponse, DnssecInfo, EvidenceRecord, Freshness,
+    IdentifierKind, IdentifierRecord, IdentityLink, InferenceRecord, InferenceSnapshot,
+    InferenceStatus, InferenceView, MacAddress, ObservationRecord, ResolverEndpoint, ServiceRecord,
+    UnknownReason, ids::new_id, time::now_ms,
 };
 use crate::infrastructure::oui::{self, OuiEntry, OuiError, OuiParseResult, OuiSourceMeta};
 
@@ -1150,6 +1151,70 @@ impl Store {
         Ok(segments)
     }
 
+    pub fn save_dns_measurements(
+        &mut self,
+        measurements: &[DnsMeasurement],
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT OR REPLACE INTO dns_measurements
+                 (id, queried_at_ms, resolver_label, resolver_address, query_name, record_type,
+                  transport, outcome, rcode, elapsed_ms, attempts, response_json, dnssec_json, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
+            for measurement in measurements {
+                statement.execute(params![
+                    measurement.id.to_string(),
+                    measurement.queried_at_ms,
+                    measurement.resolver.label,
+                    measurement.resolver.address.to_string(),
+                    measurement.query.name,
+                    measurement.query.record_type.as_str(),
+                    measurement.transport.as_str(),
+                    measurement.outcome.as_str(),
+                    measurement.rcode().map(|code| i64::from(code.code())),
+                    i64::try_from(measurement.elapsed_ms).unwrap_or(i64::MAX),
+                    i64::from(measurement.attempts),
+                    measurement.response.as_ref().map(json_string),
+                    json_string(&measurement.dnssec),
+                    measurement.error,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_dns_measurements(
+        &self,
+        name: Option<&str>,
+        record_type: Option<DnsRecordType>,
+        resolver: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DnsMeasurement>, StorageError> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(1_000);
+        let record_type = record_type.map(|value| value.as_str());
+        let mut statement = self.connection.prepare(
+            "SELECT id, queried_at_ms, resolver_label, resolver_address, query_name, record_type,
+                    transport, outcome, rcode, elapsed_ms, attempts, response_json, dnssec_json, error
+             FROM dns_measurements
+             WHERE (?1 IS NULL OR query_name = ?1)
+               AND (?2 IS NULL OR record_type = ?2)
+               AND (?3 IS NULL OR resolver_label = ?3 OR resolver_address = ?3)
+             ORDER BY queried_at_ms DESC, id DESC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(params![name, record_type, resolver, limit], |row| {
+            dns_measurement_from_row(row)
+        })?;
+        let mut measurements = Vec::new();
+        for row in rows {
+            measurements.push(row?);
+        }
+        Ok(measurements)
+    }
+
     fn load_evidence(&self, device_id: &str) -> Result<Vec<EvidenceRecord>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, observation_id, device_id, property, candidate_json, source,
@@ -1406,6 +1471,67 @@ fn snapshot_from_row(
     })
 }
 
+fn dns_measurement_from_row(row: &rusqlite::Row<'_>) -> Result<DnsMeasurement, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let resolver_address: String = row.get(3)?;
+    let record_type: String = row.get(5)?;
+    let transport: String = row.get(6)?;
+    let outcome: String = row.get(7)?;
+    let stored_rcode: Option<i64> = row.get(8)?;
+    let response_json: Option<String> = row.get(11)?;
+    let dnssec_json: String = row.get(12)?;
+
+    let response = response_json
+        .map(|value| {
+            serde_json::from_str::<DnsResponse>(&value)
+                .map_err(|error| invalid_parameter(error.to_string()))
+        })
+        .transpose()?;
+    match (&response, stored_rcode) {
+        (Some(response), Some(stored)) if i64::from(response.rcode.code()) != stored => {
+            return Err(invalid_parameter(format!(
+                "stored DNS rcode {stored} does not match the response JSON"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(invalid_parameter(
+                "stored DNS rcode exists without a response JSON".to_string(),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(invalid_parameter(
+                "stored DNS response exists without an rcode".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(DnsMeasurement {
+        id: Uuid::parse_str(&id).unwrap_or_default(),
+        queried_at_ms: row.get(1)?,
+        resolver: ResolverEndpoint {
+            label: row.get(2)?,
+            address: resolver_address.parse().map_err(invalid_parameter)?,
+        },
+        query: DnsQuery {
+            name: row.get(4)?,
+            record_type: record_type.parse().map_err(invalid_parameter)?,
+        },
+        transport: transport.parse().map_err(invalid_parameter)?,
+        outcome: outcome.parse().map_err(invalid_parameter)?,
+        elapsed_ms: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+        attempts: u32::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+        response,
+        dnssec: serde_json::from_str::<DnssecInfo>(&dnssec_json)
+            .map_err(|error| invalid_parameter(error.to_string()))?,
+        error: row.get(13)?,
+    })
+}
+
+fn invalid_parameter(error: impl std::fmt::Display) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(error.to_string())
+}
+
 fn parse_json<T: serde::de::DeserializeOwned>(value: &str, label: &str) -> Result<T, StorageError> {
     serde_json::from_str(value)
         .map_err(|error| StorageError::InvalidValue(format!("invalid stored {label}: {error}")))
@@ -1442,8 +1568,10 @@ mod tests {
         DiscoveryMethod, ScanConfig, ScanResult, ScanScope, SessionStatus,
     };
     use crate::domain::{
-        Confidence, HostObservation, HostProbe, IdentifierKind, IdentifierRecord, InferenceStatus,
-        NetworkContext, ServiceRecord, Source, Transport, ids::new_id,
+        Confidence, DnsFlags, DnsMeasurement, DnsOutcome, DnsQuery, DnsRecord, DnsRecordType,
+        DnsRecordValue, DnsResponse, DnsResponseCode, DnssecInfo, HostObservation, HostProbe,
+        IdentifierKind, IdentifierRecord, InferenceStatus, NetworkContext, ResolverEndpoint,
+        ServiceRecord, Source, Transport, ids::new_id,
     };
 
     fn sample_scan() -> ScanResult {
@@ -1527,7 +1655,7 @@ mod tests {
         let device_id = scan.devices[0].id;
         store.save_scan(&scan).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
 
         let devices = store.list_devices(None).unwrap();
         assert_eq!(devices.len(), 1);
@@ -1692,5 +1820,96 @@ mod tests {
             .unwrap();
         let mac: crate::domain::MacAddress = "02:11:22:33:44:55".parse().unwrap();
         assert!(store.lookup_oui(mac).unwrap().is_none());
+    }
+
+    #[test]
+    fn dns_measurements_round_trip_and_filter() {
+        let mut store = Store::open_in_memory().unwrap();
+        let query = DnsQuery {
+            name: "example.com.".to_string(),
+            record_type: DnsRecordType::A,
+        };
+        let resolver = ResolverEndpoint {
+            label: "system".to_string(),
+            address: "192.0.2.53:53".parse().unwrap(),
+        };
+        let success = DnsMeasurement {
+            id: new_id(),
+            queried_at_ms: 5_000,
+            resolver: resolver.clone(),
+            query: query.clone(),
+            transport: Transport::Udp,
+            outcome: DnsOutcome::Response,
+            elapsed_ms: 12,
+            attempts: 1,
+            response: Some(DnsResponse {
+                rcode: DnsResponseCode::NoError,
+                flags: DnsFlags {
+                    recursion_available: true,
+                    ..DnsFlags::default()
+                },
+                answers: vec![DnsRecord {
+                    name: "example.com.".to_string(),
+                    record_type: DnsRecordType::A,
+                    ttl: 300,
+                    value: DnsRecordValue::Address {
+                        address: "192.0.2.1".parse().unwrap(),
+                    },
+                }],
+                authority: Vec::new(),
+                answer_count: 1,
+                authority_count: 0,
+                additional_count: 1,
+            }),
+            dnssec: DnssecInfo::not_performed(true, false, false, true),
+            error: None,
+        };
+        let timeout = DnsMeasurement {
+            id: new_id(),
+            queried_at_ms: 5_100,
+            resolver: ResolverEndpoint {
+                label: "backup".to_string(),
+                address: "192.0.2.53:53".parse().unwrap(),
+            },
+            query,
+            transport: Transport::Udp,
+            outcome: DnsOutcome::Timeout,
+            elapsed_ms: 1_500,
+            attempts: 1,
+            response: None,
+            dnssec: DnssecInfo::no_response(true),
+            error: Some("no DNS response within 1500 ms".to_string()),
+        };
+
+        store
+            .save_dns_measurements(&[success.clone(), timeout.clone()])
+            .unwrap();
+
+        let all = store.list_dns_measurements(None, None, None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], timeout);
+        assert_eq!(all[1], success);
+
+        let filtered = store
+            .list_dns_measurements(
+                Some("example.com."),
+                Some(DnsRecordType::A),
+                Some("system"),
+                10,
+            )
+            .unwrap();
+        assert_eq!(filtered, vec![success.clone()]);
+
+        let by_address = store
+            .list_dns_measurements(None, None, Some("192.0.2.53:53"), 10)
+            .unwrap();
+        assert_eq!(by_address.len(), 2);
+
+        assert!(
+            store
+                .list_dns_measurements(Some("missing.example."), None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

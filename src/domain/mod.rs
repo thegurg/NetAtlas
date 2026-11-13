@@ -4,6 +4,7 @@
 
 pub mod confidence;
 pub mod device;
+pub mod dns;
 pub mod error;
 pub mod evidence;
 pub mod ids;
@@ -18,6 +19,11 @@ pub use confidence::Confidence;
 pub use device::{
     DeviceDetail, DeviceRecord, DeviceSummary, IdentifierKind, IdentifierRecord, IdentityLink,
     InferenceView, LinkStatus,
+};
+pub use dns::{
+    DnsComparison, DnsFlags, DnsMeasurement, DnsOutcome, DnsQuery, DnsRecord, DnsRecordType,
+    DnsRecordValue, DnsResponse, DnsResponseCode, DnssecInfo, DnssecValidation, ResolverEndpoint,
+    compare_measurements,
 };
 pub use error::DomainError;
 pub use evidence::{EvidenceRecord, Property};

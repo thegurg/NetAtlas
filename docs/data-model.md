@@ -1,9 +1,9 @@
 # NetAtlas data model
 
-Status: Phase 3. Migrations `0001_discovery` and `0002_inventory` are implemented and
-applied automatically. Phase 2 used the existing `services` table; Phase 3 adds
-per-session inventory snapshots. Later DNS, route, and monitoring tables do not exist
-yet.
+Status: Phase 4. Migrations `0001_discovery`, `0002_inventory`, and `0003_dns` are
+implemented and applied automatically. Phase 2 used the existing `services` table; Phase
+3 adds per-session inventory snapshots; Phase 4 adds DNS measurements. Route and
+monitoring tables do not exist yet.
 
 ## 1. Modeling principles
 
@@ -366,12 +366,45 @@ Inference (conclusion):
 }
 ```
 
+DNS measurement (fact about one query to one resolver):
+
+```json
+{
+  "resolver": {"label": "system", "address": "192.168.1.1:53"},
+  "query": {"name": "example.com.", "record_type": "A"},
+  "transport": "udp",
+  "outcome": "response",
+  "elapsed_ms": 12,
+  "attempts": 1,
+  "response": {
+    "rcode": "no_error",
+    "flags": {"recursion_available": true},
+    "answers": [
+      {"name": "example.com.", "record_type": "A", "ttl": 300,
+       "value": {"kind": "address", "address": "192.0.2.1"}}
+    ]
+  },
+  "dnssec": {
+    "validation": "not_performed",
+    "do_bit": true,
+    "ad_flag": false,
+    "rrsig_present": false,
+    "response_edns": true
+  }
+}
+```
+
+A DNS measurement is not an observation about a device. `validation: not_performed`
+means no cryptographic DNSSEC validation was done; the AD and RRSIG fields are response
+observations only.
+
 ## 5. SQLite schema
 
 Migration `0001_discovery.sql` (Phase 1) is unchanged. Phase 2 writes mDNS/UPnP/banner
 observations into the existing `services` table. Migration `0002_inventory.sql` adds
-`device_sessions` for per-session snapshots. DNS, route, and monitoring tables are added
-by later migrations.
+`device_sessions` for per-session snapshots. Migration `0003_dns.sql` adds
+`dns_measurements` for raw DNS query results. Route and monitoring tables are added by
+later migrations.
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -562,9 +595,40 @@ CREATE TABLE oui_prefixes (
 CREATE INDEX idx_oui_lookup ON oui_prefixes(prefix_bits, prefix_hex);
 ```
 
+### DNS measurements (`0003_dns`)
+
+```sql
+CREATE TABLE dns_measurements (
+    id               TEXT PRIMARY KEY,
+    queried_at_ms    INTEGER NOT NULL,
+    resolver_label   TEXT NOT NULL,
+    resolver_address TEXT NOT NULL,
+    query_name       TEXT NOT NULL,
+    record_type      TEXT NOT NULL,
+    transport        TEXT NOT NULL CHECK (transport IN ('tcp','udp')),
+    outcome          TEXT NOT NULL
+                     CHECK (outcome IN ('response','timeout','transport_error','cancelled')),
+    rcode            INTEGER,
+    elapsed_ms       INTEGER NOT NULL,
+    attempts         INTEGER NOT NULL,
+    response_json    TEXT,
+    dnssec_json      TEXT NOT NULL,
+    error            TEXT
+);
+CREATE INDEX idx_dns_measurements_time ON dns_measurements(queried_at_ms DESC);
+CREATE INDEX idx_dns_measurements_query ON dns_measurements(query_name, record_type);
+CREATE INDEX idx_dns_measurements_resolver ON dns_measurements(resolver_label, resolver_address);
+```
+
+Each row is one query to one resolver. Transport failures are stored with `outcome` set
+to `timeout`, `transport_error`, or `cancelled` and no `response_json`. `rcode` is stored
+for responses and cross-checked against `response_json` on read. `dnssec_json` always
+contains the explicit validation state and the DO/AD/RRSIG/EDNS observations; it is
+never used to claim validation. `dns_records` and `dns_comparisons` are not separate
+tables: record data lives in `response_json` and comparison is derived on read.
+
 ### Planned later migrations
 
-- `0003_dns.sql`: `dns_measurements`, `dns_records`, `dns_comparisons`, `dns_watches`.
 - `0004_route.sql`: `route_measurements`, `route_hops`, `route_samples`.
 - `0005_monitoring.sql`: `network_events`, `monitor_runs`, `import_reports`.
 - Import/export metadata tables if needed for provenance.
@@ -573,7 +637,7 @@ These are not created until their modules exist.
 
 ## 6. Migrations and integrity
 
-Implemented through Phase 3:
+Implemented through Phase 4:
 
 - Migrations are numbered SQL files embedded in the binary, applied inside a
   transaction, in order. `PRAGMA user_version` records the applied version; a database
@@ -582,7 +646,8 @@ Implemented through Phase 3:
 - Foreign keys are enabled on every connection.
 - WAL mode is enabled for concurrent reads while a scan writes.
 - One scan writes its records in one transaction, including its per-device inventory
-  snapshots. The writer serializes writes; readers use separate connections.
+  snapshots. DNS measurements are written in their own transaction. The writer serializes
+  writes; readers use separate connections.
 
 Deferred:
 

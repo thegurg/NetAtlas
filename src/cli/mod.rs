@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -15,12 +16,18 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::application::discovery::{self, ScanOptions};
+use crate::application::dns::{
+    self, DnsCompareReport, DnsHistoryFilter, DnsRunSummary, QueryOptions,
+};
 use crate::application::inventory::{self, ChangeReport, DeviceFilter, DeviceHistory, SegmentMap};
 use crate::application::model::{ScanResult, SessionStatus};
 use crate::config::Config;
 use crate::domain::time::format_short;
-use crate::domain::{DeviceDetail, DeviceSummary, InferenceRecord, NetworkContext, Property};
-use crate::infrastructure::{netlink, storage::Store};
+use crate::domain::{
+    DeviceDetail, DeviceSummary, DnsFlags, DnsMeasurement, DnsOutcome, DnsQuery, DnsRecordType,
+    InferenceRecord, NetworkContext, Property, ResolverEndpoint, Transport,
+};
+use crate::infrastructure::{dns as dns_io, netlink, storage::Store};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_OPERATIONAL: i32 = 1;
@@ -74,6 +81,11 @@ enum Command {
     Oui {
         #[command(subcommand)]
         command: OuiCommand,
+    },
+    /// Query DNS, compare resolvers, or inspect DNS measurement history.
+    Dns {
+        #[command(subcommand)]
+        command: DnsCommand,
     },
 }
 
@@ -170,6 +182,79 @@ enum OuiCommand {
         /// MAC address in any common format.
         mac: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DnsCommand {
+    /// Send one name to one or more resolvers and record the measurements.
+    Query(DnsQueryArgs),
+    /// Query two or more resolvers and compare their answers.
+    Compare(DnsCompareArgs),
+    /// List stored DNS measurements.
+    History(DnsHistoryArgs),
+}
+
+#[derive(Debug, Args)]
+struct DnsQueryArgs {
+    /// Name to query. A trailing dot is optional.
+    name: String,
+    #[command(flatten)]
+    options: DnsOptionsArgs,
+    /// Do not persist the measurements.
+    #[arg(long)]
+    no_save: bool,
+}
+
+#[derive(Debug, Args)]
+struct DnsCompareArgs {
+    /// Name to query. A trailing dot is optional.
+    name: String,
+    #[command(flatten)]
+    options: DnsOptionsArgs,
+    /// Do not persist the measurements.
+    #[arg(long)]
+    no_save: bool,
+}
+
+#[derive(Debug, Args)]
+struct DnsOptionsArgs {
+    /// Record type to query; repeatable or comma-separated. Defaults to A,AAAA.
+    #[arg(long = "type", value_name = "TYPE", value_delimiter = ',')]
+    record_types: Vec<String>,
+    /// Resolver: `system`, an IP address, `IP:PORT`, or `[IPv6]:PORT`. Repeatable.
+    #[arg(long, value_name = "RESOLVER")]
+    resolver: Vec<String>,
+    /// Send the query over TCP instead of UDP.
+    #[arg(long)]
+    tcp: bool,
+    /// Per-attempt timeout in milliseconds.
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
+    /// Number of attempts per query.
+    #[arg(long, value_name = "N")]
+    attempts: Option<u32>,
+    /// Maximum concurrent queries.
+    #[arg(long)]
+    concurrency: Option<usize>,
+    /// Do not set the EDNS DNSSEC OK (DO) bit.
+    #[arg(long)]
+    no_dnssec_ok: bool,
+}
+
+#[derive(Debug, Args)]
+struct DnsHistoryArgs {
+    /// Restrict to one query name.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+    /// Restrict to one record type.
+    #[arg(long = "type", value_name = "TYPE")]
+    record_type: Option<String>,
+    /// Restrict to one resolver label or socket address.
+    #[arg(long, value_name = "RESOLVER")]
+    resolver: Option<String>,
+    /// Maximum number of measurements to show.
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    limit: usize,
 }
 
 /// Run the CLI and return a process exit code.
@@ -392,6 +477,7 @@ async fn execute(cli: Cli) -> Result<i32> {
             Ok(EXIT_OK)
         }
         Command::Oui { command } => run_oui(command, &config, json_output),
+        Command::Dns { command } => run_dns(command, &config, json_output).await,
     }
 }
 
@@ -474,6 +560,476 @@ fn run_oui(command: OuiCommand, config: &Config, json_output: bool) -> Result<i3
             Ok(EXIT_OK)
         }
     }
+}
+
+async fn run_dns(command: DnsCommand, config: &Config, json_output: bool) -> Result<i32> {
+    match command {
+        DnsCommand::Query(args) => {
+            let options = match prepare_dns_options(&args.name, &args.options, config, false) {
+                Ok(options) => options,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    return Ok(EXIT_USAGE);
+                }
+            };
+            run_dns_queries(options, !args.no_save, config, json_output, false).await
+        }
+        DnsCommand::Compare(args) => {
+            let options = match prepare_dns_options(&args.name, &args.options, config, true) {
+                Ok(options) => options,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    return Ok(EXIT_USAGE);
+                }
+            };
+            run_dns_queries(options, !args.no_save, config, json_output, true).await
+        }
+        DnsCommand::History(args) => run_dns_history(args, config, json_output),
+    }
+}
+
+fn prepare_dns_options(
+    name: &str,
+    args: &DnsOptionsArgs,
+    config: &Config,
+    require_two_resolvers: bool,
+) -> std::result::Result<QueryOptions, String> {
+    let normalized = dns_io::normalize_name(name).map_err(|error| error.to_string())?;
+    let record_types = parse_dns_record_types(&args.record_types)?;
+    let queries = record_types
+        .into_iter()
+        .map(|record_type| DnsQuery {
+            name: normalized.clone(),
+            record_type,
+        })
+        .collect();
+    let resolvers = resolve_dns_resolvers(&args.resolver)?;
+    if require_two_resolvers && resolvers.len() < 2 {
+        return Err(
+            "compare requires at least two distinct resolvers; pass --resolver more than once"
+                .to_string(),
+        );
+    }
+
+    let timeout_ms = args.timeout_ms.unwrap_or(config.dns_timeout_ms);
+    if timeout_ms == 0 {
+        return Err("--timeout-ms must be greater than zero".to_string());
+    }
+    let attempts = args.attempts.unwrap_or(1);
+    if attempts == 0 {
+        return Err("--attempts must be at least 1".to_string());
+    }
+    let concurrency = args.concurrency.unwrap_or(config.concurrency);
+    if concurrency == 0 {
+        return Err("--concurrency must be greater than zero".to_string());
+    }
+
+    Ok(QueryOptions {
+        queries,
+        resolvers,
+        transport: if args.tcp {
+            Transport::Tcp
+        } else {
+            Transport::Udp
+        },
+        timeout: Duration::from_millis(timeout_ms),
+        attempts,
+        concurrency,
+        dnssec_ok: !args.no_dnssec_ok,
+    })
+}
+
+fn parse_dns_record_types(values: &[String]) -> std::result::Result<Vec<DnsRecordType>, String> {
+    if values.is_empty() {
+        return Ok(vec![DnsRecordType::A, DnsRecordType::Aaaa]);
+    }
+    let mut record_types = Vec::new();
+    for value in values {
+        for part in value.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let record_type = part
+                .parse::<DnsRecordType>()
+                .map_err(|error| error.to_string())?;
+            if !record_types.contains(&record_type) {
+                record_types.push(record_type);
+            }
+        }
+    }
+    if record_types.is_empty() {
+        return Err("no DNS record type was provided".to_string());
+    }
+    Ok(record_types)
+}
+
+fn resolve_dns_resolvers(values: &[String]) -> std::result::Result<Vec<ResolverEndpoint>, String> {
+    if values.is_empty() {
+        return dns_io::system_resolvers().map_err(|error| error.to_string());
+    }
+    let mut resolvers: Vec<ResolverEndpoint> = Vec::new();
+    for value in values {
+        let resolver = dns_io::parse_resolver(value).map_err(|error| error.to_string())?;
+        if !resolvers
+            .iter()
+            .any(|existing| existing.address == resolver.address)
+        {
+            resolvers.push(resolver);
+        }
+    }
+    if resolvers.is_empty() {
+        return Err("no resolver was provided".to_string());
+    }
+    Ok(resolvers)
+}
+
+async fn run_dns_queries(
+    options: QueryOptions,
+    save: bool,
+    config: &Config,
+    json_output: bool,
+    compare: bool,
+) -> Result<i32> {
+    let cancel = CancellationToken::new();
+    install_cancel_handler(&cancel);
+    let measurements = dns::execute(&options, &cancel).await;
+    let summary = dns::summarize(&measurements);
+    let exit_code = dns_exit_code(&measurements);
+
+    if save {
+        let mut store = Store::open(&config.db_path)?;
+        dns::persist(&mut store, &measurements)?;
+    }
+
+    if json_output {
+        if compare {
+            let report = dns::compare(&measurements);
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "comparison": report,
+                "summary": summary,
+                "saved": save,
+            }))?;
+        } else {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "measurements": measurements,
+                "summary": summary,
+                "saved": save,
+            }))?;
+        }
+    } else if compare {
+        print_dns_comparison(&dns::compare(&measurements));
+        print_dns_summary(&summary, save);
+    } else {
+        for measurement in &measurements {
+            print_dns_measurement(measurement);
+        }
+        print_dns_summary(&summary, save);
+    }
+
+    Ok(exit_code)
+}
+
+fn run_dns_history(args: DnsHistoryArgs, config: &Config, json_output: bool) -> Result<i32> {
+    let mut filter = DnsHistoryFilter {
+        limit: args.limit,
+        ..DnsHistoryFilter::default()
+    };
+    if let Some(name) = args.name {
+        match dns_io::normalize_name(&name) {
+            Ok(name) => filter.name = Some(name),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return Ok(EXIT_USAGE);
+            }
+        }
+    }
+    if let Some(record_type) = args.record_type {
+        match record_type.parse::<DnsRecordType>() {
+            Ok(record_type) => filter.record_type = Some(record_type),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return Ok(EXIT_USAGE);
+            }
+        }
+    }
+    filter.resolver = args.resolver;
+    if filter.limit == 0 {
+        eprintln!("error: --limit must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+
+    let store = Store::open(&config.db_path)?;
+    let measurements = dns::history(&store, &filter)?;
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "history": measurements,
+            "filter": {
+                "name": filter.name,
+                "record_type": filter.record_type.map(|value| value.as_str()),
+                "resolver": filter.resolver,
+                "limit": filter.limit,
+            }
+        }))?;
+    } else if measurements.is_empty() {
+        println!("No DNS measurements match this filter.");
+    } else {
+        print_dns_history(&measurements);
+    }
+    Ok(EXIT_OK)
+}
+
+fn dns_exit_code(measurements: &[DnsMeasurement]) -> i32 {
+    if measurements.is_empty() {
+        return EXIT_OPERATIONAL;
+    }
+    let failed = measurements
+        .iter()
+        .filter(|measurement| measurement.is_transport_failure())
+        .count();
+    let cancelled = measurements
+        .iter()
+        .filter(|measurement| measurement.outcome == DnsOutcome::Cancelled)
+        .count();
+    if failed + cancelled == measurements.len() {
+        EXIT_OPERATIONAL
+    } else if failed > 0 || cancelled > 0 {
+        EXIT_PARTIAL
+    } else {
+        EXIT_OK
+    }
+}
+
+fn print_dns_measurement(measurement: &DnsMeasurement) {
+    println!(
+        "{} {}",
+        measurement.query.name, measurement.query.record_type
+    );
+    println!(
+        "  resolver {}  transport {}  {} ms  attempts {}",
+        measurement.resolver,
+        measurement.transport.as_str().to_ascii_uppercase(),
+        measurement.elapsed_ms,
+        measurement.attempts
+    );
+    match (&measurement.outcome, &measurement.response) {
+        (DnsOutcome::Response, Some(response)) => {
+            println!(
+                "  outcome response  RCODE {}  flags {}",
+                response.rcode,
+                dns_flag_labels(&response.flags)
+            );
+            if response.answers.is_empty() {
+                println!(
+                    "  answers none (a negative answer or a referral is still a DNS response)"
+                );
+            } else {
+                for record in &response.answers {
+                    println!(
+                        "  answer {} {} {} {}",
+                        record.name,
+                        record.record_type,
+                        record.ttl,
+                        record.value.display_value()
+                    );
+                }
+            }
+            if !response.authority.is_empty() {
+                println!("  authority:");
+                for record in &response.authority {
+                    println!(
+                        "    {} {} {} {}",
+                        record.name,
+                        record.record_type,
+                        record.ttl,
+                        record.value.display_value()
+                    );
+                }
+            }
+            println!(
+                "  counts answer {} authority {} additional {}",
+                response.answer_count, response.authority_count, response.additional_count
+            );
+        }
+        (outcome, _) => {
+            println!(
+                "  outcome {}  {}",
+                outcome.as_str(),
+                measurement.error.as_deref().unwrap_or("no detail")
+            );
+        }
+    }
+    let dnssec = &measurement.dnssec;
+    println!(
+        "  DNSSEC validation {}  DO {}  AD {}  RRSIG {}  response EDNS {}",
+        dnssec.validation.as_str(),
+        yes_no(dnssec.do_bit),
+        yes_no(dnssec.ad_flag),
+        yes_no(dnssec.rrsig_present),
+        yes_no(dnssec.response_edns)
+    );
+}
+
+fn print_dns_comparison(report: &DnsCompareReport) {
+    if report.comparisons.is_empty() {
+        println!("No DNS comparison was produced.");
+        return;
+    }
+    println!("DNS comparison for {}", report.name);
+    println!("Resolvers:");
+    for resolver in &report.resolvers {
+        println!("  {resolver}");
+    }
+    for comparison in &report.comparisons {
+        println!();
+        println!("{} {}", comparison.query.name, comparison.query.record_type);
+        println!(
+            "  responded {}  failed {}  cancelled {}  comparable {}",
+            comparison.responded,
+            comparison.failed,
+            comparison.cancelled,
+            yes_no(comparison.comparable)
+        );
+        println!(
+            "  RCODE consistent {}  answers consistent {}  TTL varied {}  DNSSEC varied {}",
+            yes_no(comparison.rcode_consistent),
+            yes_no(comparison.answers_consistent),
+            yes_no(comparison.ttl_varied),
+            yes_no(comparison.dnssec_varied)
+        );
+        for measurement in &comparison.measurements {
+            match (&measurement.outcome, &measurement.response) {
+                (DnsOutcome::Response, Some(response)) => {
+                    let answers = response
+                        .answers
+                        .iter()
+                        .map(|record| {
+                            format!(
+                                "{} {} {}",
+                                record.record_type,
+                                record.ttl,
+                                record.value.display_value()
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "  {}  {}  {} ms  {}",
+                        measurement.resolver.label,
+                        response.rcode,
+                        measurement.elapsed_ms,
+                        if answers.is_empty() {
+                            "no answers".to_string()
+                        } else {
+                            answers.join("; ")
+                        }
+                    );
+                }
+                (outcome, _) => {
+                    println!(
+                        "  {}  {}  {} ms  {}",
+                        measurement.resolver.label,
+                        outcome.as_str(),
+                        measurement.elapsed_ms,
+                        measurement.error.as_deref().unwrap_or("no detail")
+                    );
+                }
+            }
+        }
+        for note in &comparison.notes {
+            println!("  note: {note}");
+        }
+    }
+    println!();
+    println!("Overall consistent: {}", yes_no(report.consistent));
+    println!("Note: {}", report.note);
+}
+
+fn print_dns_summary(summary: &DnsRunSummary, saved: bool) {
+    println!();
+    println!(
+        "Summary: {} queries, {} responses, {} transport failures, {} cancelled.{}",
+        summary.total,
+        summary.responded,
+        summary.failed,
+        summary.cancelled,
+        if saved {
+            " Measurements saved."
+        } else {
+            " Measurements not saved."
+        }
+    );
+    println!("Note: {}", summary.note);
+    println!(
+        "DNSSEC: no cryptographic validation was performed; the AD flag and RRSIG presence are observations, not a validation result."
+    );
+}
+
+fn print_dns_history(measurements: &[DnsMeasurement]) {
+    let mut rows = Vec::new();
+    for measurement in measurements {
+        rows.push(vec![
+            format_short(measurement.queried_at_ms),
+            measurement.query.name.clone(),
+            measurement.query.record_type.as_str().to_string(),
+            measurement.resolver.label.clone(),
+            measurement.resolver.address.to_string(),
+            measurement.transport.as_str().to_string(),
+            measurement.outcome.as_str().to_string(),
+            measurement
+                .rcode()
+                .map(|code| code.name().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            measurement.elapsed_ms.to_string(),
+        ]);
+    }
+    print_table(
+        &[
+            "TIME",
+            "NAME",
+            "TYPE",
+            "RESOLVER",
+            "ADDRESS",
+            "TRANSPORT",
+            "OUTCOME",
+            "RCODE",
+            "MS",
+        ],
+        rows,
+    );
+}
+
+fn dns_flag_labels(flags: &DnsFlags) -> String {
+    let mut labels = Vec::new();
+    if flags.authoritative {
+        labels.push("aa");
+    }
+    if flags.truncated {
+        labels.push("tc");
+    }
+    if flags.recursion_desired {
+        labels.push("rd");
+    }
+    if flags.recursion_available {
+        labels.push("ra");
+    }
+    if flags.authentic_data {
+        labels.push("ad");
+    }
+    if flags.checking_disabled {
+        labels.push("cd");
+    }
+    if labels.is_empty() {
+        "none".to_string()
+    } else {
+        labels.join(" ")
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn install_cancel_handler(token: &CancellationToken) {

@@ -40,6 +40,7 @@ fn help_lists_available_commands() {
         "changes",
         "history",
         "oui",
+        "dns",
     ] {
         assert!(stdout.contains(expected), "help did not mention {expected}");
     }
@@ -192,4 +193,216 @@ fn missing_history_device_returns_not_found_exit_code() {
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
     assert!(String::from_utf8_lossy(&output.stderr).contains("was not found"));
+}
+
+fn spawn_dns_server(answer: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    use hickory_resolver::proto::op::{Message, OpCode};
+    use hickory_resolver::proto::rr::rdata::A;
+    use hickory_resolver::proto::rr::{RData, Record};
+
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4_096];
+        let (length, peer) = socket.recv_from(&mut buffer).unwrap();
+        let request = Message::from_vec(&buffer[..length]).unwrap();
+        let mut response = Message::response(request.metadata.id, OpCode::Query);
+        response.metadata.recursion_available = true;
+        for query in &request.queries {
+            response.add_query(query.clone());
+        }
+        if let Some(query) = request.queries.first() {
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                300,
+                RData::A(A(answer.parse().unwrap())),
+            ));
+        }
+        let bytes = response.to_vec().unwrap();
+        socket.send_to(&bytes, peer).unwrap();
+    });
+    (port, handle)
+}
+
+#[test]
+fn dns_query_records_a_response_and_history() {
+    let (port, server) = spawn_dns_server("192.0.2.1");
+    let (dir, mut command, _db) = command();
+    let resolver = format!("127.0.0.1:{port}");
+    let output = command
+        .args([
+            "dns",
+            "query",
+            "example.test",
+            "--type",
+            "A",
+            "--resolver",
+            &resolver,
+            "--timeout-ms",
+            "1000",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["saved"], true);
+    let measurement = &value["measurements"][0];
+    assert_eq!(measurement["query"]["name"], "example.test.");
+    assert_eq!(measurement["query"]["record_type"], "A");
+    assert_eq!(measurement["outcome"], "response");
+    assert_eq!(measurement["response"]["rcode"], "no_error");
+    assert_eq!(
+        measurement["response"]["answers"][0]["value"]["address"],
+        "192.0.2.1"
+    );
+    assert_eq!(measurement["response"]["answers"][0]["ttl"], 300);
+    assert_eq!(measurement["dnssec"]["validation"], "not_performed");
+
+    let (mut command, _db) = command_in(&dir);
+    let output = command.args(["dns", "history", "--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["history"].as_array().unwrap().len(), 1);
+    assert_eq!(value["history"][0]["query"]["name"], "example.test.");
+}
+
+#[test]
+fn dns_transport_failure_returns_operational_exit_code() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let (_dir, mut command, _db) = command();
+    let resolver = format!("127.0.0.1:{port}");
+    let output = command
+        .args([
+            "dns",
+            "query",
+            "example.test",
+            "--type",
+            "A",
+            "--resolver",
+            &resolver,
+            "--timeout-ms",
+            "100",
+            "--no-save",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    drop(socket);
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["saved"], false);
+    assert_eq!(value["measurements"][0]["outcome"], "timeout");
+    assert_eq!(
+        value["measurements"][0]["dnssec"]["validation"],
+        "not_performed"
+    );
+    assert!(value["measurements"][0]["response"].is_null());
+}
+
+#[test]
+fn dns_compare_detects_differing_answers() {
+    let (first_port, first) = spawn_dns_server("192.0.2.1");
+    let (second_port, second) = spawn_dns_server("192.0.2.2");
+    let (_dir, mut command, _db) = command();
+    let first_resolver = format!("127.0.0.1:{first_port}");
+    let second_resolver = format!("127.0.0.1:{second_port}");
+    let output = command
+        .args([
+            "dns",
+            "compare",
+            "example.test",
+            "--type",
+            "A",
+            "--resolver",
+            &first_resolver,
+            "--resolver",
+            &second_resolver,
+            "--no-save",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let comparison = &value["comparison"]["comparisons"][0];
+    assert_eq!(comparison["responded"], 2);
+    assert_eq!(comparison["comparable"], true);
+    assert_eq!(comparison["answers_consistent"], false);
+    assert_eq!(comparison["consistent"], false);
+    assert_eq!(value["comparison"]["consistent"], false);
+}
+
+#[test]
+fn dns_invalid_record_type_is_a_usage_error() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args([
+            "dns",
+            "query",
+            "example.test",
+            "--type",
+            "ANY",
+            "--resolver",
+            "127.0.0.1:9",
+            "--no-save",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid DNS record type"));
+}
+
+#[test]
+fn dns_compare_requires_two_resolvers() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args([
+            "dns",
+            "compare",
+            "example.test",
+            "--type",
+            "A",
+            "--resolver",
+            "127.0.0.1:9",
+            "--no-save",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least two distinct resolvers"));
+}
+
+#[test]
+fn dns_history_without_measurements_is_empty() {
+    let (_dir, mut command, _db) = command();
+    let output = command.args(["dns", "history", "--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["history"], Value::Array(Vec::new()));
 }

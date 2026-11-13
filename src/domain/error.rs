@@ -28,6 +28,14 @@ pub enum DomainError {
     InvalidLinkStatus(String),
     #[error("invalid transport: {0}")]
     InvalidTransport(String),
+    #[error("invalid DNS record type: {0}")]
+    InvalidDnsRecordType(String),
+    #[error("invalid DNS response code: {0}")]
+    InvalidDnsResponseCode(String),
+    #[error("invalid DNS outcome: {0}")]
+    InvalidDnsOutcome(String),
+    #[error("invalid DNSSEC validation state: {0}")]
+    InvalidDnssecState(String),
     #[error("invalid MAC prefix length {0}; expected 24, 28, or 36 bits")]
     InvalidPrefixBits(u8),
     #[error("IP prefix {0} is too large to enumerate safely")]

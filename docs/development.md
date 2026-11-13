@@ -1,8 +1,7 @@
 # NetAtlas development guide
 
-Status: Phase 3 (LAN inventory, history, change detection, and segment map) implemented.
-The TUI, DNS diagnostics, route exploration, monitoring, and import/export are not
-implemented yet.
+Status: Phase 4 (DNS diagnostics) implemented. The TUI, route exploration, monitoring,
+import/export, and cryptographic DNSSEC validation are not implemented yet.
 
 ## 1. Environment baseline
 
@@ -48,6 +47,9 @@ cargo run -- devices
 cargo run -- device <uuid>
 cargo run -- oui status
 cargo run -- oui lookup 3c:cd:5d:11:22:33
+cargo run -- dns query example.com --type A,AAAA --json
+cargo run -- dns compare example.com --type A --resolver system --resolver 1.1.1.1
+cargo run -- dns history --name example.com --limit 10
 ```
 
 Live-network checks are opt-in and must never run during ordinary `cargo test`. The
@@ -76,7 +78,7 @@ Versions verified against crates.io on 2026-11-11.
 | --- | --- | --- |
 | `clap` | 4.6.7 | CLI parsing, help, usage errors |
 | `tokio` | 1.54.1 | Async runtime; required by rtnetlink, hickory, surge-ping |
-| `tokio-util` | 0.7.20 | `CancellationToken` for scans |
+| `tokio-util` | 0.7.20 | `CancellationToken` for scans and DNS queries |
 | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | Structured logging on stderr |
 | `thiserror` | 2.0.21 | Typed domain/provider/storage errors |
 | `anyhow` | 1.0.104 | Context at application/CLI boundaries |
@@ -88,7 +90,7 @@ Versions verified against crates.io on 2026-11-11.
 | `rusqlite` | 0.42.0 | SQLite with `bundled` for reproducibility |
 | `rtnetlink` | 0.24.0 | Links, addresses, routes, neighbour table |
 | `surge-ping` | 0.9.1 | Unprivileged ICMP echo |
-| `hickory-resolver` | 0.26.3 | Reverse DNS through the system resolver |
+| `hickory-resolver` | 0.26.3 | Reverse DNS, system resolver configuration, and DNS protocol types |
 | `mdns-sd` | 0.21.7 | Bounded mDNS/DNS-SD browse and service resolution |
 | `roxmltree` | 0.21.2 | Bounded UPnP device-description XML parsing |
 | `futures-util` | 0.3.31 | Bounded `buffer_unordered` probe scheduling |
@@ -114,8 +116,9 @@ Dev dependencies: `tempfile` 3.27, `assert_cmd` 2.2, `predicates` 3.1.
 
 ### Deferred dependencies
 
-`hickory-proto`, `ratatui`, and `crossterm` are planned for later phases and are not in
-`Cargo.toml` yet. TLS inspection would require an explicit TLS dependency and a separate
+`ratatui` and `crossterm` are planned for the TUI phase and are not in `Cargo.toml` yet.
+`hickory-proto` is used through the `hickory_resolver::proto` re-export rather than as a
+direct dependency. TLS inspection would require an explicit TLS dependency and a separate
 design review.
 
 ## 4. Code organization and standards
@@ -185,8 +188,11 @@ Standards:
 | TCP probe outcomes | Local listener open/refused, cancellation | `src/infrastructure/tcp_probe.rs` |
 | Inventory | Freshness, new/not-observed events, partial caveat, address/MAC/hostname/inference changes, unchanged devices | `src/domain/inventory.rs` |
 | Inventory views | Scope matching, history, search/filter, longest-prefix segment grouping, unassigned devices | `src/application/inventory.rs` |
-| SQLite | `:memory:` migrations, OUI import/lookup, scan/service/snapshot round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
-| CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, filters, map/changes/history, OUI import/lookup | `tests/cli.rs` |
+| DNS domain | Record-type/RCODE parsing, DNSSEC states, TTL/case-insensitive comparison, transport-failure handling | `src/domain/dns.rs` |
+| DNS transport | Local mock UDP/TCP servers, RCODE/TTL/flags capture, truncation fallback, timeout, cancellation, resolver/name parsing | `src/infrastructure/dns.rs` |
+| DNS application | Grouping by record type, comparison summary, history filter defaults | `src/application/dns.rs` |
+| SQLite | `:memory:` migrations, OUI import/lookup, scan/service/snapshot/DNS round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
+| CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, filters, map/changes/history, OUI import/lookup, DNS query/compare/history | `tests/cli.rs` |
 
 ### Fixtures
 
@@ -292,12 +298,29 @@ Phase 3 limitations: history begins with the first scan after migration `0002_in
 the map is logical subnet grouping, not physical topology; stale data is not an offline
 determination; change events are derived on read rather than stored.
 
-### Phase 4 — DNS analysis (next)
+### Phase 4 — DNS analysis (done)
 
-Deliverables: A/AAAA/CNAME/MX/NS/TXT/SOA queries, custom resolvers, timing, RCODE, TTL,
-resolver comparison, explicit DNSSEC validation state, DNS history.
+Deliverables implemented:
 
-### Phase 5 — route explorer
+- Migration `0003_dns` with `dns_measurements`, including transport failures.
+- Raw UDP/TCP DNS client over hickory protocol types, with RCODE, flags, TTLs, EDNS,
+  AD, and RRSIG capture, bounded timeouts/retries, cancellation, and UDP truncation
+  fallback to TCP.
+- A/AAAA/CNAME/MX/NS/TXT/SOA queries, custom resolver syntax, and system resolver
+  discovery.
+- Resolver comparison with RCODE and answer-set agreement, TTL variation, DNSSEC-field
+  variation, and explicit transport-failure notes.
+- Explicit DNSSEC state: `not_performed` plus DO/AD/RRSIG/EDNS observations. No
+  cryptographic validation is claimed.
+- CLI commands `dns query`, `dns compare`, and `dns history`, with text/JSON output and
+  documented exit codes.
+- Deterministic tests using local mock UDP/TCP servers; no live network required.
+
+Phase 4 limitations: no cryptographic DNSSEC validation, DoT/DoH, CNAME-chain walking,
+scheduled DNS monitoring, or retention job; only seven record types are modelled; DNS
+results are point-in-time and resolver-specific.
+
+### Phase 5 — route explorer (next)
 
 Deliverables: ICMP/UDP/TCP traceroute, configurable hops/timeouts/probes, RTT and loss
 with sample counts, reverse DNS, route comparison.

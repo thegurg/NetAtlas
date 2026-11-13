@@ -3,13 +3,14 @@
 Linux-first network exploration and diagnostics in Rust, with a CLI and a TUI over one
 shared engine and SQLite history.
 
-> **Status: Phase 3 — LAN inventory and map.** The CLI, discovery providers, identity
+> **Status: Phase 4 — DNS diagnostics.** The CLI, discovery providers, identity
 > resolution, OUI lookup, evidence/inference pipeline, mDNS, SSDP/UPnP, NetBIOS, safe
 > TCP service probes, SQLite persistence, per-session inventory snapshots, device
-> history, change detection, segment grouping, filtering, and stale-data indicators are
-> implemented. The TUI, DNS diagnostics, route exploration, monitoring, and
-> import/export are not implemented yet. This README describes what works now and what
-> remains limited; it is not a claim that later-phase features exist.
+> history, change detection, segment grouping, filtering, stale-data indicators, raw DNS
+> queries, resolver comparison, DNS measurement history, and explicit DNSSEC observation
+> state are implemented. The TUI, route exploration, monitoring, import/export, and
+> cryptographic DNSSEC validation are not implemented yet. This README describes what
+> works now and what remains limited; it is not a claim that later-phase features exist.
 
 ## What works now
 
@@ -25,6 +26,9 @@ netatlas history <uuid>
 netatlas oui status
 netatlas oui import path/to/oui.csv --version 2026-11
 netatlas oui lookup 3c:cd:5d:11:22:33
+netatlas dns query example.com [--type A,AAAA] [--resolver 1.1.1.1]
+netatlas dns compare example.com --resolver system --resolver 1.1.1.1
+netatlas dns history [--name example.com] [--type A] [--resolver system]
 ```
 
 Every command supports `--json`, `--help`, and the documented exit codes. A global
@@ -111,14 +115,38 @@ inventory threshold (overridable with `--stale-after-ms`); it is a data-freshnes
 indicator, not an online/offline determination. Segment grouping is logical (IP prefix),
 not physical switch or access-point topology.
 
+### DNS diagnostics
+
+`netatlas dns query` sends A, AAAA, CNAME, MX, NS, TXT, or SOA queries (default
+`A,AAAA`) to one or more resolvers and records a measurement per query. Each measurement
+includes the resolver, transport, timing, attempts, RCODE, header flags, TTLs, answer and
+authority records, and section counts. Transport failures are stored as measurements too.
+
+`--resolver` accepts `system`, an IP address, `IP:PORT`, or `[IPv6]:PORT`; it is
+repeatable. With no `--resolver`, the system resolver list is read from the system
+configuration. `netatlas dns compare` requires at least two distinct resolvers and reports
+RCODE agreement, answer-set agreement, TTL variation, and DNSSEC-related field variation.
+Answer-set equality ignores TTL and DNS name case; TTL differences are reported
+separately because caching is expected.
+
+DNSSEC is reported honestly: the client can set the EDNS DO bit and records the AD flag,
+RRSIG presence, and EDNS presence, but the validation state is always `not_performed`.
+No cryptographic validation, trust-anchor management, or chain-of-trust claim is made.
+See [docs/dns.md](docs/dns.md).
+
+Exit codes for DNS commands: `0` when every query produced a DNS response (including
+NXDOMAIN/SERVFAIL/REFUSED), `1` when every query failed at the transport level, `3` for
+partial transport failure or cancellation, and `2` for usage errors.
+
 ### Persistence
 
 SQLite migration `0001_discovery` stores interfaces, addresses, segments, scan sessions,
 devices, identifiers, observations, evidence, inferences, identity links, services, and
 OUI sources/prefixes. Migration `0002_inventory` adds per-session device snapshots used
-for history and change detection. Foreign keys and WAL are enabled. The IEEE
-MA-L/MA-M/MA-S snapshot under `data/oui/` is embedded in the binary and imported on first
-open.
+for history and change detection. Migration `0003_dns` adds `dns_measurements` for raw
+DNS query results, timing, RCODEs, and explicit DNSSEC observation state. Foreign keys
+and WAL are enabled. The IEEE MA-L/MA-M/MA-S snapshot under `data/oui/` is embedded in
+the binary and imported on first open.
 
 ## Current limitations
 
@@ -141,12 +169,19 @@ open.
 - Inventory history begins with the first scan recorded after migration `0002_inventory`.
   Earlier sessions have raw observations but no compact snapshot, so they cannot be
   compared by `changes` or shown in per-session `history`.
+- DNS history begins with the first measurement recorded after migration `0003_dns`.
+- DNS results are point-in-time measurements from one resolver. Cached answers and
+  split-horizon DNS can legitimately differ; a match is not proof of correct
+  configuration. Only the seven listed record types are modelled.
+- DNSSEC validation is not implemented. The AD flag and RRSIG presence are observations,
+  not a local validation result.
+- No DNS-over-TLS, DNS-over-HTTPS, scheduled DNS monitoring, or CNAME-chain walking yet.
 - Segment grouping uses the most recently seen address for each device and the prefixes
   recorded from network context. It does not infer physical topology, VLANs, or
   switch/AP attachment.
 - Stale records are not offline devices. A device can be present but unobserved because
   of sleep, firewall rules, client isolation, or scope limits.
-- No TUI, DNS query/comparison, traceroute, monitoring, or import/export yet.
+- No TUI, traceroute, monitoring, or import/export yet.
 - No live-network tests run during `cargo test`; they are opt-in only.
 
 ## Build and test
@@ -160,8 +195,9 @@ cargo run -- --help
 ```
 
 Deterministic tests cover domain rules, OUI parsing/lookup, identity resolution,
-inference, protocol parsers (mDNS/SSDP/NetBIOS/service banners), inventory change
-detection and filtering, SQLite migration/round-trip, TCP probe outcomes, and CLI
+inference, protocol parsers (mDNS/SSDP/NetBIOS/service banners), DNS name/resolver
+parsing, DNS transport behavior against local mock servers, DNS comparison, inventory
+change detection and filtering, SQLite migration/round-trip, TCP probe outcomes, and CLI
 behavior. They do not require a live network.
 
 ## Principles
@@ -183,6 +219,7 @@ behavior. They do not require a live network.
 | [docs/data-model.md](docs/data-model.md) | Domain entities, identity rules, evidence model, SQLite schema and migrations |
 | [docs/identification.md](docs/identification.md) | Identification pipeline, evidence reliability, confidence rubric, acceptance tests |
 | [docs/inventory.md](docs/inventory.md) | Inventory snapshots, history, change semantics, segment map, freshness |
+| [docs/dns.md](docs/dns.md) | DNS queries, resolver selection, comparison, exit codes, DNSSEC honesty, history |
 | [docs/development.md](docs/development.md) | Toolchain, dependencies, testing policy, coding standards, roadmap |
 
 ## Safety
