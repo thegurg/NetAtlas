@@ -497,3 +497,117 @@ fn route_trace_loopback_round_trips_and_history_shows_run() {
     let history_value: Value = serde_json::from_slice(&history.stdout).unwrap();
     assert_eq!(history_value["history"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn export_json_and_csv_create_files() {
+    let (dir, mut command, _db) = command();
+    let json_out = dir.path().join("export.json");
+    let csv_out = dir.path().join("devices.csv");
+
+    let output = command
+        .args([
+            "export",
+            "json",
+            "--output",
+            json_out.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["export"]["format"], "json");
+    assert!(json_out.exists());
+    let exported: Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_out).unwrap()).unwrap();
+    assert_eq!(exported["schema_version"], 1);
+
+    let (mut command2, _db) = command_in(&dir);
+    let output = command2
+        .args([
+            "export",
+            "csv",
+            "--output",
+            csv_out.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["export"]["format"], "csv");
+    assert_eq!(value["export"]["lossy"], true);
+    assert!(csv_out.exists());
+    let csv = std::fs::read_to_string(&csv_out).unwrap();
+    assert!(csv.starts_with("id,first_seen_ms"));
+}
+
+#[test]
+fn db_backup_integrity_and_restore_round_trip() {
+    let (dir, mut command, db) = command();
+    let backup = dir.path().join("backup.db");
+    let restored = dir.path().join("restored.db");
+
+    // Ensure DB exists and is valid.
+    let integrity = command
+        .args(["db", "integrity", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        integrity.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&integrity.stderr)
+    );
+    let value: Value = serde_json::from_slice(&integrity.stdout).unwrap();
+    assert_eq!(value["database"]["ok"], true);
+
+    let (mut backup_cmd, _db) = command_in(&dir);
+    let output = backup_cmd
+        .args([
+            "db",
+            "backup",
+            "--output",
+            backup.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(backup.exists());
+
+    let (mut restore_cmd, _db) = command_in(&dir);
+    let output = restore_cmd
+        .args([
+            "db",
+            "restore",
+            "--input",
+            backup.to_str().unwrap(),
+            "--to",
+            restored.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(restored.exists());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["restore"]["integrity"], "ok");
+    assert!(value["restore"]["schema_version"].as_i64().unwrap() >= 4);
+    let _ = db;
+}

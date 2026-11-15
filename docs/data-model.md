@@ -724,13 +724,15 @@ Freshness windows used by identification:
 These are defaults, not hard-coded truth; they are recorded in session config so a
 historical inference can be explained.
 
-## 8. Import/export mapping (later phases)
+## 8. Import/export mapping (Phase 6 in progress)
 
-- JSON export preserves full records including evidence, inference rationale, and
-  timestamps.
-- CSV is lossy: it can carry device rows, identifiers, and current inferences, but not
-  the full evidence graph. The CSV header/docs will state which fields are omitted.
-- Import is versioned, validated, dry-runnable, and transactional. Duplicate detection
-  is by stable IDs plus natural keys; conflicts are reported, never silently merged.
-- SQLite backup/restore uses the SQLite backup API or a consistent file copy while the
-  database is quiescent, followed by integrity checks.
+- JSON export is implemented as a versioned point-in-time snapshot (`schema_version`,
+  `exported_at_ms`) including device summaries/details, DNS measurements, and route runs.
+  It preserves evidence, inferences, observations, and timestamps present in exported
+  records.
+- CSV export is implemented as a lossy current-device-summary table; it omits the
+  evidence graph, observations, per-identifier history, DNS measurements, and route runs.
+- SQLite backup/restore is implemented via the SQLite online backup API plus integrity
+  verification; restore validates the backup and replaces the destination file.
+- Import remains planned: versioned, validated, dry-runnable, and transactional, with
+  duplicate detection by stable IDs/natural keys and conflict reporting (no silent merge).

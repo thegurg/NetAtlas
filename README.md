@@ -187,7 +187,12 @@ binary and imported on first open.
   switch/AP attachment.
 - Stale records are not offline devices. A device can be present but unobserved because
   of sleep, firewall rules, client isolation, or scope limits.
-- No TUI, monitoring, or import/export yet.
+- JSON export is a point-in-time snapshot; CSV export is lossy (no evidence graph,
+  observations, identifier history, DNS, or route measurements). Exports contain
+  network observations and should be treated as sensitive data.
+- Validated transactional import with dry-run/conflict reporting, scheduled monitoring,
+  monitor-run/event storage, and automatic change-detection jobs are not implemented yet.
+- No TUI or cryptographic DNSSEC validation yet.
 - No live-network tests run during `cargo test`; they are opt-in only.
 
 ## Build and test
@@ -227,6 +232,7 @@ behavior. They do not require a live network.
 | [docs/inventory.md](docs/inventory.md) | Inventory snapshots, history, change semantics, segment map, freshness |
 | [docs/dns.md](docs/dns.md) | DNS queries, resolver selection, comparison, exit codes, DNSSEC honesty, history |
 | [docs/route.md](docs/route.md) | Route tracing, hop/loss/RTT semantics, comparison, and limitations |
+| [docs/export.md](docs/export.md) | JSON/CSV export, SQLite backup/restore/integrity, and limitations |
 | [docs/development.md](docs/development.md) | Toolchain, dependencies, testing policy, coding standards, roadmap |
 
 ## Safety

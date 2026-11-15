@@ -1,10 +1,12 @@
 # NetAtlas architecture
 
-Status: Phase 5 implemented (inventory snapshots, history, change detection, segment
-grouping, filtering, freshness, raw DNS queries, resolver comparison, DNS measurement
-history, and route trace/history/compare). Cryptographic DNSSEC validation is not
-implemented. Later-phase modules are described where they affect the current boundaries,
-but they do not exist yet.
+Status: Phase 5 complete, Phase 6 in progress (inventory snapshots, history, change
+detection, segment grouping, filtering, freshness, raw DNS queries, resolver comparison,
+DNS measurement history, route trace/history/compare, JSON/CSV export, and SQLite
+backup/restore/integrity). Validated transactional import with dry-run, scheduled
+monitoring/change-detection jobs, and cryptographic DNSSEC validation are not implemented.
+Later-phase modules are described where they affect the current boundaries, but they do
+not exist yet.
 
 ## 1. Goals and non-goals
 
@@ -121,8 +123,9 @@ src/
   cli/                    clap definitions, handlers, table/JSON output
 ```
 
-Planned later modules: `application/monitor.rs`, `application/export.rs`, and `tui/`.
-They are not created as empty placeholders.
+Planned later modules: `application/monitor.rs` and `tui/`. `application/export.rs` exists
+for the current export/backup/restore slice; validated transactional import and scheduled
+monitoring remain planned. They are not created as empty placeholders.
 
 Feature modules (`discovery`, `identification`, `lan`, `dns`, `route`, `monitoring`)
 are realized as application services plus infrastructure adapters, not as separate

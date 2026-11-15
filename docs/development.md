@@ -1,7 +1,9 @@
 # NetAtlas development guide
 
-Status: Phase 5 (route explorer) implemented. The TUI, monitoring, import/export, and
-cryptographic DNSSEC validation are not implemented yet.
+Status: Phase 5 complete, Phase 6 in progress (route explorer done; export/backup/restore
+slice implemented). Validated transactional import with dry-run, scheduled
+monitoring/change-detection jobs, the TUI, and cryptographic DNSSEC validation are not
+implemented yet.
 
 ## 1. Environment baseline
 
@@ -54,6 +56,11 @@ cargo run -- route trace example.com
 cargo run -- route trace 1.1.1.1 --method icmp --max-hops 20 --probes 2 --timeout-ms 1000
 cargo run -- route history --json
 cargo run -- route compare example.com --method udp --json
+cargo run -- export json --output ./netatlas-export.json
+cargo run -- export csv --output ./devices.csv
+cargo run -- db integrity
+cargo run -- db backup --output ./netatlas-backup.db
+cargo run -- db restore --input ./netatlas-backup.db --to ./netatlas-restored.db
 ```
 
 Live-network checks are opt-in and must never run during ordinary `cargo test`. The
@@ -356,10 +363,23 @@ discovery, AS/geo enrichment, or continuous route monitoring. Hop discovery depe
 `IP_RECVERR` and environment ICMP permissions. Non-responsive hops and route variability
 are reported as measurements, never as proof of a broken route.
 
-### Phase 6 — monitoring and import/export
+### Phase 6 — monitoring and import/export (in progress)
 
-Deliverables: opt-in scheduled scans/DNS checks, change detection, JSON/CSV export,
-SQLite backup/restore, validated transactional import with dry-run.
+Implemented in this slice:
+
+- Versioned JSON export (`export json`) of device summaries/details (including evidence,
+  inferences, observations, services when available), DNS measurements, and route runs.
+- Lossy CSV export (`export csv`) of current device summaries with documented omissions.
+- SQLite maintenance commands: `db integrity`, `db backup` (online backup API + integrity
+  verification), and `db restore` (validated backup, schema check, destination copy, stale
+  WAL/SHM cleanup).
+- Deterministic application/storage/CLI coverage for export and backup/restore flows.
+
+Remaining Phase 6 work:
+
+- Validated, transactional import with dry-run and conflict reporting (no silent merge).
+- Opt-in scheduled scans/DNS checks, monitor-run/event persistence, and change-detection
+  jobs/history beyond on-demand comparisons.
 
 ### Phase 7 — TUI
 

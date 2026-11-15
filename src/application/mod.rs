@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod dns;
+pub mod export;
 pub mod identify;
 pub mod identity;
 pub mod inventory;

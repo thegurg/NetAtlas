@@ -105,6 +105,22 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
+    pub fn integrity_check(&self) -> Result<String, StorageError> {
+        Ok(self
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?)
+    }
+
+    pub fn backup_to(&self, destination: &Path) -> Result<(), StorageError> {
+        self.connection
+            .backup(
+                rusqlite::MAIN_DB,
+                destination,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
+            .map_err(StorageError::from)
+    }
+
     pub fn ensure_embedded_oui(&mut self) -> Result<(), StorageError> {
         if self.oui_source()?.is_some() {
             return Ok(());

@@ -19,6 +19,7 @@ use crate::application::discovery::{self, ScanOptions};
 use crate::application::dns::{
     self, DnsCompareReport, DnsHistoryFilter, DnsRunSummary, QueryOptions,
 };
+use crate::application::export;
 use crate::application::inventory::{self, ChangeReport, DeviceFilter, DeviceHistory, SegmentMap};
 use crate::application::model::{ScanResult, SessionStatus};
 use crate::application::route::{self, RouteHistoryFilter, RouteOptions, RouteRunSummary};
@@ -93,6 +94,16 @@ enum Command {
     Route {
         #[command(subcommand)]
         command: RouteCommand,
+    },
+    /// Export inventory, DNS, and route data.
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
+    },
+    /// Database maintenance operations.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
     },
 }
 
@@ -329,6 +340,43 @@ struct RouteCompareArgs {
     against_run: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum ExportCommand {
+    /// Export a versioned JSON snapshot (includes device details, evidence, inferences, DNS, routes).
+    Json {
+        /// Output file path.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Export a lossy CSV of current device summaries (no evidence graph, observations, DNS, or routes).
+    Csv {
+        /// Output file path.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DbCommand {
+    /// Create a consistent SQLite backup and verify its integrity.
+    Backup {
+        /// Destination backup file path.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Restore the database from a validated backup file.
+    Restore {
+        /// Backup file to restore from.
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        /// Replace this database path instead of the configured one.
+        #[arg(long, value_name = "PATH")]
+        to: Option<PathBuf>,
+    },
+    /// Run SQLite integrity check on the configured database.
+    Integrity,
+}
+
 /// Run the CLI and return a process exit code.
 pub async fn run() -> i32 {
     let cli = Cli::parse();
@@ -551,6 +599,8 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Oui { command } => run_oui(command, &config, json_output),
         Command::Dns { command } => run_dns(command, &config, json_output).await,
         Command::Route { command } => run_route(command, &config, json_output).await,
+        Command::Export { command } => run_export(command, &config, json_output),
+        Command::Db { command } => run_db(command, &config, json_output),
     }
 }
 
@@ -1447,6 +1497,147 @@ fn print_route_comparison(comparison: &RouteComparison) {
     println!("  right run: {}", comparison.right_run_id);
     for note in &comparison.notes {
         println!("  note: {note}");
+    }
+}
+
+fn run_export(command: ExportCommand, config: &Config, json_output: bool) -> Result<i32> {
+    let store = Store::open(&config.db_path)?;
+    match command {
+        ExportCommand::Json { output } => {
+            let export = export::export_json(&store)?;
+            export::write_json(&output, &export)?;
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "export": {
+                        "format": "json",
+                        "output": output.display().to_string(),
+                        "devices": export.devices.len(),
+                        "dns_measurements": export.dns_measurements.len(),
+                        "route_runs": export.route_runs.len(),
+                        "export_schema_version": export.schema_version,
+                    }
+                }))?;
+            } else {
+                println!(
+                    "Exported JSON to {} ({} device(s), {} DNS measurement(s), {} route run(s)).",
+                    output.display(),
+                    export.devices.len(),
+                    export.dns_measurements.len(),
+                    export.route_runs.len()
+                );
+                println!(
+                    "JSON preserves device details, evidence, inferences, DNS measurements, and route runs."
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        ExportCommand::Csv { output } => {
+            let devices = store.list_devices(None)?;
+            export::write_devices_csv(&output, &devices)?;
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "export": {
+                        "format": "csv",
+                        "output": output.display().to_string(),
+                        "devices": devices.len(),
+                        "lossy": true,
+                        "omitted": ["evidence_graph", "observations", "per_identifier_history", "dns_measurements", "route_runs"]
+                    }
+                }))?;
+            } else {
+                println!(
+                    "Exported lossy CSV to {} ({} device summary row(s)).",
+                    output.display(),
+                    devices.len()
+                );
+                println!(
+                    "CSV omits evidence, observations, per-identifier history, DNS measurements, and route runs."
+                );
+            }
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+fn run_db(command: DbCommand, config: &Config, json_output: bool) -> Result<i32> {
+    match command {
+        DbCommand::Backup { output } => {
+            let store = Store::open(&config.db_path)?;
+            export::backup_database(&store, &output)?;
+            let schema = store.schema_version()?;
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "backup": {
+                        "output": output.display().to_string(),
+                        "source": config.db_path.display().to_string(),
+                        "schema_version": schema,
+                        "integrity": "ok",
+                    }
+                }))?;
+            } else {
+                println!(
+                    "Backup created at {} (schema {}, integrity ok).",
+                    output.display(),
+                    schema
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        DbCommand::Restore { input, to } => {
+            let destination = to.unwrap_or_else(|| config.db_path.clone());
+            export::restore_database(&input, &destination)?;
+            let reopened = Store::open(&destination)?;
+            let schema = reopened.schema_version()?;
+            let integrity = reopened.integrity_check()?;
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "restore": {
+                        "input": input.display().to_string(),
+                        "destination": destination.display().to_string(),
+                        "schema_version": schema,
+                        "integrity": integrity,
+                    }
+                }))?;
+            } else {
+                println!(
+                    "Restored {} to {} (schema {}, integrity {}).",
+                    input.display(),
+                    destination.display(),
+                    schema,
+                    integrity
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        DbCommand::Integrity => {
+            let store = Store::open(&config.db_path)?;
+            let integrity = store.integrity_check()?;
+            let schema = store.schema_version()?;
+            let ok = integrity == "ok";
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "database": {
+                        "path": config.db_path.display().to_string(),
+                        "schema_version": schema,
+                        "integrity": integrity,
+                        "ok": ok,
+                    }
+                }))?;
+            } else {
+                println!(
+                    "Database {}: schema {}, integrity {}",
+                    config.db_path.display(),
+                    schema,
+                    integrity
+                );
+            }
+            Ok(if ok { EXIT_OK } else { EXIT_OPERATIONAL })
+        }
     }
 }
 
