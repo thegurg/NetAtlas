@@ -112,6 +112,8 @@ enum Command {
         #[command(subcommand)]
         command: MonitorCommand,
     },
+    /// Launch the interactive terminal UI.
+    Tui,
     /// Database maintenance operations.
     Db {
         #[command(subcommand)]
@@ -651,6 +653,12 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Export { command } => run_export(command, &config, json_output),
         Command::Import { command } => run_import(command, &config, json_output),
         Command::Monitor { command } => run_monitor(command, &config, json_output).await,
+        Command::Tui => {
+            // TUI is interactive and owns terminal I/O; JSON mode is not applicable.
+            let _ = json_output;
+            crate::tui::run(&config)?;
+            Ok(EXIT_OK)
+        }
         Command::Db { command } => run_db(command, &config, json_output),
     }
 }

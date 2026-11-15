@@ -3,13 +3,15 @@
 Linux-first network exploration and diagnostics in Rust, with a CLI over a shared engine
 and SQLite history. (TUI planned.)
 
-> **Status:** Phase 5 complete; Phase 6 in progress. Discovery, identification, LAN
-> inventory/map, OUI import/lookup, DNS query/compare/history, route trace/history/
-> compare, JSON/CSV export, SQLite backup/restore/integrity, and JSON import with dry-run
-> for non-conflicting DNS/route measurements are implemented. Full conflict-aware
-> session/device identity import, scheduled monitoring/change detection, the TUI, and
-> cryptographic DNSSEC validation are not implemented yet. This README describes what
-> works now and what remains limited.
+> **Status:** Phase 5 complete; Phase 6 in progress; Phase 7 (TUI) started. Discovery,
+> identification, LAN inventory/map, OUI import/lookup, DNS query/compare/history, route
+> trace/history/compare, JSON/CSV export, SQLite backup/restore/integrity, JSON import with
+> dry-run for non-conflicting DNS/route measurements, opt-in scan monitoring, and an
+> initial interactive TUI are implemented. Full conflict-aware session/device identity
+> import, richer scheduled/DNS monitoring automation, full TUI feature coverage
+> (in-app scans/DNS/route actions, settings, import/export flows), and cryptographic DNSSEC
+> validation are not implemented yet. This README describes what works now and what remains
+> limited.
 
 ## What works now
 
@@ -38,6 +40,7 @@ netatlas import json --input ./netatlas-export.json
 netatlas monitor scan [--target 192.168.1.0/24] [--interval-seconds 300]
 netatlas monitor runs [--kind scan]
 netatlas monitor events [--run <uuid>] [--severity change]
+netatlas tui
 netatlas db integrity
 netatlas db backup --output ./netatlas-backup.db
 netatlas db restore --input ./netatlas-backup.db [--to ./netatlas-restored.db]
@@ -210,6 +213,11 @@ binary and imported on first open.
 - Opt-in scan monitoring is implemented (`monitor scan`/`runs`/`events`) with persisted
   runs and scan-derived change events; scheduled DNS monitoring checks and richer automated
   monitoring jobs are not implemented yet.
+- Initial TUI (`netatlas tui`) provides dashboard, devices (filter/search, stale toggle),
+  device detail (evidence/inferences/identifiers/services), map (logical segment view),
+  DNS and route history, monitoring runs/events, and history/changes views with background
+  loading, scrolling/navigation, and terminal restore. In-TUI scan/DNS/route/monitor
+  execution with progress/cancellation, settings, and import/export workflows are follow-up work.
 - No TUI or cryptographic DNSSEC validation yet.
 - No live-network tests run during `cargo test`; they are opt-in only.
 

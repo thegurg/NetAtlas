@@ -1,9 +1,10 @@
 # NetAtlas development guide
 
-Status: Phase 5 complete, Phase 6 in progress (route explorer done; export/backup/restore
-slice implemented). Validated transactional import with dry-run, scheduled
-monitoring/change-detection jobs, the TUI, and cryptographic DNSSEC validation are not
-implemented yet.
+Status: Phase 5 complete, Phase 6 in progress, Phase 7 (TUI) started. Route explorer,
+export/backup/restore/import (measurement slice), scan monitoring, and an initial
+interactive TUI are implemented. Full conflict-aware identity import, richer scheduled/DNS
+monitoring automation, full TUI feature coverage, and cryptographic DNSSEC validation are
+not implemented yet.
 
 ## 1. Environment baseline
 
@@ -129,7 +130,7 @@ Dev dependencies: `tempfile` 3.27, `assert_cmd` 2.2, `predicates` 3.1.
 
 ### Deferred dependencies
 
-`ratatui` and `crossterm` are planned for the TUI phase and are not in `Cargo.toml` yet.
+`ratatui` 0.30.2 and `crossterm` 0.29.0 are used for the initial TUI slice.
 `hickory-proto` is used through the `hickory_resolver::proto` re-export rather than as a
 direct dependency. TLS inspection would require an explicit TLS dependency and a separate
 design review.
@@ -396,11 +397,25 @@ Remaining Phase 6 work:
 - Scheduled DNS monitoring checks, richer event taxonomy/jobs, and additional
   change-detection automation beyond scan-derived events.
 
-### Phase 7 — TUI
+### Phase 7 — TUI (in progress)
 
-Deliverables: dashboard, map, devices, device details/evidence, DNS, route, monitoring,
-history, import/export, settings; background tasks, progress, cancellation, terminal
-restoration.
+Implemented in current slice:
+
+- `netatlas tui` command with Ratatui/Crossterm terminal setup/restore.
+- Non-blocking UI loop with background data loading (devices, sessions, network context,
+  DNS/route history, monitor runs/events, segment map, latest change report) via worker
+  threads/channels.
+- Views: dashboard, devices, device detail, map, DNS history, route history, monitoring
+  (runs/events), and history/changes.
+- Device search/filter input, stale-only toggle, keyboard navigation, scrolling, refresh,
+  and explicit stale/unknown/change presentation with evidence-based notes.
+
+Remaining Phase 7 work:
+
+- In-TUI actions for discover/DNS/route/monitor operations with progress/cancellation.
+- Import/export and settings views/workflows.
+- Richer sorting/column controls, deeper detail/history drill-down, and improved
+  layout/state handling for large datasets.
 
 ### Phase 8 — hardening
 
