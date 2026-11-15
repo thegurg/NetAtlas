@@ -7,6 +7,7 @@ pub mod netbios;
 pub mod netlink;
 pub mod oui;
 pub mod reverse_dns;
+pub mod route;
 pub mod service_probe;
 pub mod ssdp;
 pub mod storage;

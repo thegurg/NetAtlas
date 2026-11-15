@@ -18,8 +18,9 @@ use crate::domain::{
     Confidence, DEFAULT_STALE_AFTER_MS, DeviceDetail, DeviceSessionSnapshot, DeviceSummary,
     DnsMeasurement, DnsQuery, DnsRecordType, DnsResponse, DnssecInfo, EvidenceRecord, Freshness,
     IdentifierKind, IdentifierRecord, IdentityLink, InferenceRecord, InferenceSnapshot,
-    InferenceStatus, InferenceView, MacAddress, ObservationRecord, ResolverEndpoint, ServiceRecord,
-    UnknownReason, ids::new_id, time::now_ms,
+    InferenceStatus, InferenceView, MacAddress, ObservationRecord, ResolverEndpoint, RouteHop,
+    RouteProbeMethod, RouteRun, RouteSample, ServiceRecord, UnknownReason, ids::new_id,
+    time::now_ms,
 };
 use crate::infrastructure::oui::{self, OuiEntry, OuiError, OuiParseResult, OuiSourceMeta};
 
@@ -1215,6 +1216,146 @@ impl Store {
         Ok(measurements)
     }
 
+    pub fn save_route_run(&mut self, run: &RouteRun) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO route_runs
+             (id, target, target_ip, method, port, started_at_ms, finished_at_ms, max_hops,
+              probes_per_hop, status, target_reached, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                run.id.to_string(),
+                run.target,
+                run.target_ip.to_string(),
+                run.method.as_str(),
+                run.port.map(i64::from),
+                run.started_at_ms,
+                run.finished_at_ms,
+                i64::from(run.max_hops),
+                i64::from(run.probes_per_hop),
+                run.status.as_str(),
+                if run.target_reached { 1_i64 } else { 0_i64 },
+                run.error,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM route_hops WHERE run_id = ?1",
+            params![run.id.to_string()],
+        )?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO route_hops
+                 (run_id, ttl, responder, hostname, samples_json, reply_count, timeout_count,
+                  error_count, best_rtt_ms, avg_rtt_ms, loss_ratio)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            for hop in &run.hops {
+                statement.execute(params![
+                    run.id.to_string(),
+                    i64::from(hop.ttl),
+                    hop.responder.map(|value| value.to_string()),
+                    hop.hostname,
+                    json_string(&hop.samples),
+                    i64::try_from(hop.reply_count).unwrap_or(i64::MAX),
+                    i64::try_from(hop.timeout_count).unwrap_or(i64::MAX),
+                    i64::try_from(hop.error_count).unwrap_or(i64::MAX),
+                    hop.best_rtt_ms,
+                    hop.avg_rtt_ms,
+                    hop.loss_ratio,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_route_runs(
+        &self,
+        target_ip: Option<std::net::IpAddr>,
+        method: Option<RouteProbeMethod>,
+        limit: usize,
+    ) -> Result<Vec<RouteRun>, StorageError> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(1_000);
+        let target_ip = target_ip.map(|value| value.to_string());
+        let method = method.map(|value| value.as_str());
+        let mut statement = self.connection.prepare(
+            "SELECT id, target, target_ip, method, port, started_at_ms, finished_at_ms, max_hops,
+                    probes_per_hop, status, target_reached, error
+             FROM route_runs
+             WHERE (?1 IS NULL OR target_ip = ?1)
+               AND (?2 IS NULL OR method = ?2)
+             ORDER BY started_at_ms DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![target_ip, method, limit], route_run_from_row)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(self.load_route_hops(row?)?);
+        }
+        Ok(runs)
+    }
+
+    pub fn list_route_runs_for_compare(
+        &self,
+        target_ip: std::net::IpAddr,
+        method: RouteProbeMethod,
+        port: Option<u16>,
+        limit: usize,
+    ) -> Result<Vec<RouteRun>, StorageError> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(1_000);
+        let mut statement = self.connection.prepare(
+            "SELECT id, target, target_ip, method, port, started_at_ms, finished_at_ms, max_hops,
+                    probes_per_hop, status, target_reached, error
+             FROM route_runs
+             WHERE target_ip = ?1 AND method = ?2 AND ((?3 IS NULL AND port IS NULL) OR port = ?3)
+             ORDER BY started_at_ms DESC, id DESC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                target_ip.to_string(),
+                method.as_str(),
+                port.map(i64::from),
+                limit
+            ],
+            route_run_from_row,
+        )?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(self.load_route_hops(row?)?);
+        }
+        Ok(runs)
+    }
+
+    pub fn get_route_run(&self, id: uuid::Uuid) -> Result<Option<RouteRun>, StorageError> {
+        let run = self
+            .connection
+            .query_row(
+                "SELECT id, target, target_ip, method, port, started_at_ms, finished_at_ms, max_hops,
+                        probes_per_hop, status, target_reached, error
+                 FROM route_runs WHERE id = ?1",
+                params![id.to_string()],
+                route_run_from_row,
+            )
+            .optional()?;
+        run.map(|run| self.load_route_hops(run)).transpose()
+    }
+
+    fn load_route_hops(&self, mut run: RouteRun) -> Result<RouteRun, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ttl, responder, hostname, samples_json, reply_count, timeout_count, error_count,
+                    best_rtt_ms, avg_rtt_ms, loss_ratio
+             FROM route_hops WHERE run_id = ?1 ORDER BY ttl ASC",
+        )?;
+        let rows = statement.query_map(params![run.id.to_string()], route_hop_from_row)?;
+        let mut hops = Vec::new();
+        for row in rows {
+            hops.push(row?);
+        }
+        run.hops = hops;
+        Ok(run)
+    }
+
     fn load_evidence(&self, device_id: &str) -> Result<Vec<EvidenceRecord>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, observation_id, device_id, property, candidate_json, source,
@@ -1424,6 +1565,65 @@ impl Store {
         }
         Ok(links)
     }
+}
+
+fn route_run_from_row(row: &rusqlite::Row<'_>) -> Result<RouteRun, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let target_ip: String = row.get(2)?;
+    let method: String = row.get(3)?;
+    let status: String = row.get(9)?;
+    Ok(RouteRun {
+        id: Uuid::parse_str(&id).unwrap_or_default(),
+        target: row.get(1)?,
+        target_ip: target_ip
+            .parse()
+            .map_err(|error: std::net::AddrParseError| {
+                rusqlite::Error::InvalidParameterName(error.to_string())
+            })?,
+        method: method
+            .parse()
+            .map_err(|error: crate::domain::DomainError| {
+                rusqlite::Error::InvalidParameterName(error.to_string())
+            })?,
+        port: row.get::<_, Option<i64>>(4)?.map(|value| value as u16),
+        started_at_ms: row.get(5)?,
+        finished_at_ms: row.get(6)?,
+        max_hops: row.get::<_, i64>(7)? as u8,
+        probes_per_hop: row.get::<_, i64>(8)? as u32,
+        status: status
+            .parse()
+            .map_err(|error: crate::domain::DomainError| {
+                rusqlite::Error::InvalidParameterName(error.to_string())
+            })?,
+        target_reached: row.get::<_, i64>(10)? != 0,
+        hops: Vec::new(),
+        error: row.get(11)?,
+    })
+}
+
+fn route_hop_from_row(row: &rusqlite::Row<'_>) -> Result<RouteHop, rusqlite::Error> {
+    let responder: Option<String> = row.get(1)?;
+    let samples_json: String = row.get(3)?;
+    let samples: Vec<RouteSample> = serde_json::from_str(&samples_json)
+        .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+    Ok(RouteHop {
+        ttl: row.get::<_, i64>(0)? as u8,
+        responder: responder
+            .map(|value| {
+                value.parse().map_err(|error: std::net::AddrParseError| {
+                    rusqlite::Error::InvalidParameterName(error.to_string())
+                })
+            })
+            .transpose()?,
+        hostname: row.get(2)?,
+        samples,
+        reply_count: row.get::<_, i64>(4)? as usize,
+        timeout_count: row.get::<_, i64>(5)? as usize,
+        error_count: row.get::<_, i64>(6)? as usize,
+        best_rtt_ms: row.get(7)?,
+        avg_rtt_ms: row.get(8)?,
+        loss_ratio: row.get(9)?,
+    })
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>, offset: usize) -> Result<SessionRecord, StorageError> {
@@ -1655,7 +1855,7 @@ mod tests {
         let device_id = scan.devices[0].id;
         store.save_scan(&scan).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
 
         let devices = store.list_devices(None).unwrap();
         assert_eq!(devices.len(), 1);
@@ -1911,5 +2111,77 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn route_runs_round_trip_and_filter() {
+        use crate::domain::route::{
+            RouteProbeMethod, RouteProbeOutcome, RouteRun, RouteRunStatus, RouteSample,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        let sample = RouteSample {
+            probe_index: 0,
+            sent_at_ms: 1_000,
+            outcome: RouteProbeOutcome::IcmpError,
+            responder: Some("192.0.2.254".parse().unwrap()),
+            rtt_ms: Some(2.5),
+            icmp_type: Some(11),
+            icmp_code: Some(0),
+            error: None,
+        };
+        let hop = crate::domain::route::aggregate_hop(1, vec![sample.clone()]);
+        let mut run = RouteRun {
+            id: new_id(),
+            target: "example.com".to_string(),
+            target_ip: "192.0.2.1".parse().unwrap(),
+            method: RouteProbeMethod::Udp,
+            port: Some(33434),
+            started_at_ms: 1_000,
+            finished_at_ms: 1_500,
+            max_hops: 30,
+            probes_per_hop: 1,
+            status: RouteRunStatus::Partial,
+            target_reached: false,
+            hops: vec![hop],
+            error: None,
+        };
+        run.hops[0].hostname = Some("gateway.local".to_string());
+
+        store.save_route_run(&run).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 4);
+
+        let listed = store.list_route_runs(None, None, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, run.id);
+        assert_eq!(listed[0].hops.len(), 1);
+        assert_eq!(listed[0].hops[0].hostname.as_deref(), Some("gateway.local"));
+        assert_eq!(listed[0].hops[0].samples, vec![sample]);
+
+        let by_target = store
+            .list_route_runs(
+                Some("192.0.2.1".parse().unwrap()),
+                Some(RouteProbeMethod::Udp),
+                10,
+            )
+            .unwrap();
+        assert_eq!(by_target.len(), 1);
+
+        let compare = store
+            .list_route_runs_for_compare(
+                "192.0.2.1".parse().unwrap(),
+                RouteProbeMethod::Udp,
+                Some(33434),
+                10,
+            )
+            .unwrap();
+        assert_eq!(compare.len(), 1);
+
+        let fetched = store.get_route_run(run.id).unwrap().unwrap();
+        assert_eq!(fetched.target_ip, run.target_ip);
+        assert_eq!(
+            fetched.hops[0].responder,
+            Some("192.0.2.254".parse().unwrap())
+        );
+        assert!(store.get_route_run(new_id()).unwrap().is_none());
     }
 }

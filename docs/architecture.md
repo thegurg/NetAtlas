@@ -1,10 +1,10 @@
 # NetAtlas architecture
 
-Status: Phase 4 implemented (inventory snapshots, history, change detection, segment
-grouping, filtering, freshness, raw DNS queries, resolver comparison, and DNS
-measurement history). Cryptographic DNSSEC validation is not implemented. Later-phase
-modules are described where they affect the current boundaries, but they do not exist
-yet.
+Status: Phase 5 implemented (inventory snapshots, history, change detection, segment
+grouping, filtering, freshness, raw DNS queries, resolver comparison, DNS measurement
+history, and route trace/history/compare). Cryptographic DNSSEC validation is not
+implemented. Later-phase modules are described where they affect the current boundaries,
+but they do not exist yet.
 
 ## 1. Goals and non-goals
 
@@ -78,6 +78,12 @@ src/
   lib.rs                  public crate surface for integration tests
   config/                 XDG paths, config.toml, defaults, validation
   domain/
+    route.rs              route probes, hops, runs, aggregation, comparison
+  application/
+    route.rs              trace/history/compare/persist orchestration
+  infrastructure/
+    route.rs              unprivileged ICMP/UDP/TCP hop probing via IP_RECVERR
+  domain/ (continued)
     ids.rs                UUIDv7 identifier creation
     time.rs               UTC millisecond timestamps and formatting
     network.rs            MAC, interface, address, segment, gateway, host enumeration
@@ -88,6 +94,7 @@ src/
     inference.rs          candidate conclusions, conflicts, unknown reasons
     inventory.rs          snapshots, freshness, change detection
     dns.rs                DNS queries, response codes, measurements, comparison
+    route.rs              route probes, hops, runs, aggregation, comparison
     confidence.rs         confidence enum and aggregation rubric
     error.rs              domain errors
   application/
@@ -97,12 +104,14 @@ src/
     identify.rs           evidence extraction and inference
     inventory.rs          filtering, segment map, history, change reports
     dns.rs                query orchestration, resolver comparison, DNS history
+    route.rs              trace orchestration, history, comparison, persistence
   infrastructure/
     netlink.rs            links, addresses, routes, neighbour table
     icmp.rs               ICMP echo provider (surge-ping)
     tcp_probe.rs          bounded TCP connect fallback
     reverse_dns.rs        PTR lookup through hickory
     dns.rs                raw UDP/TCP DNS client with RCODE/flags/TTL capture
+    route.rs              unprivileged ICMP/UDP/TCP hop probing via IP_RECVERR
     mdns.rs               bounded mDNS/DNS-SD browse adapter
     ssdp.rs               SSDP M-SEARCH plus bounded UPnP description fetch
     netbios.rs            wildcard NBSTAT name-table queries
@@ -112,8 +121,8 @@ src/
   cli/                    clap definitions, handlers, table/JSON output
 ```
 
-Planned later modules: `application/route.rs`, `application/monitor.rs`,
-`application/export.rs`, and `tui/`. They are not created as empty placeholders.
+Planned later modules: `application/monitor.rs`, `application/export.rs`, and `tui/`.
+They are not created as empty placeholders.
 
 Feature modules (`discovery`, `identification`, `lan`, `dns`, `route`, `monitoring`)
 are realized as application services plus infrastructure adapters, not as separate

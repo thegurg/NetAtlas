@@ -36,6 +36,12 @@ pub enum DomainError {
     InvalidDnsOutcome(String),
     #[error("invalid DNSSEC validation state: {0}")]
     InvalidDnssecState(String),
+    #[error("invalid route probe method: {0}")]
+    InvalidRouteProbeMethod(String),
+    #[error("invalid route probe outcome: {0}")]
+    InvalidRouteProbeOutcome(String),
+    #[error("invalid route run status: {0}")]
+    InvalidRouteRunStatus(String),
     #[error("invalid MAC prefix length {0}; expected 24, 28, or 36 bits")]
     InvalidPrefixBits(u8),
     #[error("IP prefix {0} is too large to enumerate safely")]

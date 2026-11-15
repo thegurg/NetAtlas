@@ -1,9 +1,9 @@
 # NetAtlas data model
 
-Status: Phase 4. Migrations `0001_discovery`, `0002_inventory`, and `0003_dns` are
-implemented and applied automatically. Phase 2 used the existing `services` table; Phase
-3 adds per-session inventory snapshots; Phase 4 adds DNS measurements. Route and
-monitoring tables do not exist yet.
+Status: Phase 5. Migrations `0001_discovery`, `0002_inventory`, `0003_dns`, and
+`0004_route` are implemented and applied automatically. Phase 2 used the existing
+`services` table; Phase 3 adds per-session inventory snapshots; Phase 4 adds DNS
+measurements; Phase 5 adds route runs and hops. Monitoring tables do not exist yet.
 
 ## 1. Modeling principles
 
@@ -627,9 +627,48 @@ contains the explicit validation state and the DO/AD/RRSIG/EDNS observations; it
 never used to claim validation. `dns_records` and `dns_comparisons` are not separate
 tables: record data lives in `response_json` and comparison is derived on read.
 
+`0004_route` stores route measurements:
+
+```sql
+CREATE TABLE route_runs (
+    id               TEXT PRIMARY KEY,
+    target           TEXT NOT NULL,
+    target_ip        TEXT NOT NULL,
+    method           TEXT NOT NULL CHECK (method IN ('icmp','udp','tcp')),
+    port             INTEGER,
+    started_at_ms    INTEGER NOT NULL,
+    finished_at_ms   INTEGER NOT NULL,
+    max_hops         INTEGER NOT NULL,
+    probes_per_hop   INTEGER NOT NULL,
+    status           TEXT NOT NULL
+                     CHECK (status IN ('completed','partial','no_response','failed','cancelled')),
+    target_reached   INTEGER NOT NULL CHECK (target_reached IN (0,1)),
+    error            TEXT
+);
+
+CREATE TABLE route_hops (
+    run_id           TEXT NOT NULL REFERENCES route_runs(id) ON DELETE CASCADE,
+    ttl              INTEGER NOT NULL,
+    responder        TEXT,
+    hostname         TEXT,
+    samples_json     TEXT NOT NULL,
+    reply_count      INTEGER NOT NULL,
+    timeout_count    INTEGER NOT NULL,
+    error_count      INTEGER NOT NULL,
+    best_rtt_ms      REAL,
+    avg_rtt_ms       REAL,
+    loss_ratio       REAL NOT NULL,
+    PRIMARY KEY (run_id, ttl)
+);
+```
+
+Each run is one point-in-time trace to one resolved target. Per-hop `samples_json`
+preserves individual probe outcomes, responder addresses, RTTs, and ICMP type/code where
+available; aggregate hop fields are derived from those samples. A timeout is recorded as
+a sample outcome, not as proof that the route is broken.
+
 ### Planned later migrations
 
-- `0004_route.sql`: `route_measurements`, `route_hops`, `route_samples`.
 - `0005_monitoring.sql`: `network_events`, `monitor_runs`, `import_reports`.
 - Import/export metadata tables if needed for provenance.
 

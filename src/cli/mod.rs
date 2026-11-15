@@ -21,11 +21,13 @@ use crate::application::dns::{
 };
 use crate::application::inventory::{self, ChangeReport, DeviceFilter, DeviceHistory, SegmentMap};
 use crate::application::model::{ScanResult, SessionStatus};
+use crate::application::route::{self, RouteHistoryFilter, RouteOptions, RouteRunSummary};
 use crate::config::Config;
 use crate::domain::time::format_short;
 use crate::domain::{
     DeviceDetail, DeviceSummary, DnsFlags, DnsMeasurement, DnsOutcome, DnsQuery, DnsRecordType,
-    InferenceRecord, NetworkContext, Property, ResolverEndpoint, Transport,
+    InferenceRecord, NetworkContext, Property, ResolverEndpoint, RouteComparison, RouteHop,
+    RouteProbeMethod, RouteRun, RouteRunStatus, Transport,
 };
 use crate::infrastructure::{dns as dns_io, netlink, storage::Store};
 
@@ -86,6 +88,11 @@ enum Command {
     Dns {
         #[command(subcommand)]
         command: DnsCommand,
+    },
+    /// Trace routes, compare runs, or inspect route measurement history.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
     },
 }
 
@@ -255,6 +262,71 @@ struct DnsHistoryArgs {
     /// Maximum number of measurements to show.
     #[arg(long, default_value_t = 50, value_name = "N")]
     limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
+enum RouteCommand {
+    /// Trace the route to a target and record the measurement.
+    Trace(RouteTraceArgs),
+    /// List stored route measurements.
+    History(RouteHistoryArgs),
+    /// Compare stored route measurements for the same target and method.
+    Compare(RouteCompareArgs),
+}
+
+#[derive(Debug, Args)]
+struct RouteTraceArgs {
+    /// Target hostname or IPv4 address.
+    target: String,
+    /// Probe method: icmp, udp, or tcp.
+    #[arg(long, default_value = "udp")]
+    method: String,
+    /// Destination port for udp/tcp probes.
+    #[arg(long, default_value_t = 33434)]
+    port: u16,
+    /// Maximum hops (TTL limit).
+    #[arg(long, default_value_t = 30)]
+    max_hops: u8,
+    /// Probes per hop.
+    #[arg(long, default_value_t = 3)]
+    probes: u32,
+    /// Per-probe timeout in milliseconds.
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
+    /// Maximum concurrent probe tasks.
+    #[arg(long)]
+    concurrency: Option<usize>,
+    /// Do not persist the measurement.
+    #[arg(long)]
+    no_save: bool,
+}
+
+#[derive(Debug, Args)]
+struct RouteHistoryArgs {
+    /// Restrict to one target IPv4 address.
+    #[arg(long, value_name = "IP")]
+    target: Option<String>,
+    /// Restrict to one probe method.
+    #[arg(long, value_name = "METHOD")]
+    method: Option<String>,
+    /// Maximum number of runs to show.
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct RouteCompareArgs {
+    /// Target hostname or IPv4 address. Used to find the latest comparable runs.
+    target: String,
+    /// Probe method of the runs to compare.
+    #[arg(long, default_value = "udp")]
+    method: String,
+    /// Destination port for udp/tcp probes.
+    #[arg(long, default_value_t = 33434)]
+    port: u16,
+    /// Compare the latest run against this specific run UUID instead of the previous one.
+    #[arg(long, value_name = "UUID")]
+    against_run: Option<String>,
 }
 
 /// Run the CLI and return a process exit code.
@@ -478,6 +550,7 @@ async fn execute(cli: Cli) -> Result<i32> {
         }
         Command::Oui { command } => run_oui(command, &config, json_output),
         Command::Dns { command } => run_dns(command, &config, json_output).await,
+        Command::Route { command } => run_route(command, &config, json_output).await,
     }
 }
 
@@ -1030,6 +1103,351 @@ fn dns_flag_labels(flags: &DnsFlags) -> String {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+async fn run_route(command: RouteCommand, config: &Config, json_output: bool) -> Result<i32> {
+    match command {
+        RouteCommand::Trace(args) => run_route_trace(args, config, json_output).await,
+        RouteCommand::History(args) => run_route_history(args, config, json_output),
+        RouteCommand::Compare(args) => run_route_compare(args, config, json_output),
+    }
+}
+
+async fn run_route_trace(args: RouteTraceArgs, config: &Config, json_output: bool) -> Result<i32> {
+    let method = match args.method.parse::<RouteProbeMethod>() {
+        Ok(method) => method,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(EXIT_USAGE);
+        }
+    };
+    if args.max_hops == 0 {
+        eprintln!("error: --max-hops must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+    if args.probes == 0 {
+        eprintln!("error: --probes must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+    let timeout_ms = args.timeout_ms.unwrap_or(config.dns_timeout_ms.max(500));
+    if timeout_ms == 0 {
+        eprintln!("error: --timeout-ms must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+    let concurrency = args.concurrency.unwrap_or(config.concurrency);
+    if concurrency == 0 {
+        eprintln!("error: --concurrency must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+
+    let options = RouteOptions {
+        target: args.target,
+        method,
+        port: args.port,
+        max_hops: args.max_hops,
+        probes_per_hop: args.probes,
+        timeout: Duration::from_millis(timeout_ms),
+        concurrency,
+    };
+
+    let cancel = CancellationToken::new();
+    install_cancel_handler(&cancel);
+    let run = match route::trace(&options, &cancel).await {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(EXIT_OPERATIONAL);
+        }
+    };
+
+    if !args.no_save {
+        let mut store = Store::open(&config.db_path)?;
+        route::persist(&mut store, &run)?;
+    }
+
+    let summary = RouteRunSummary::from(&run);
+    let exit_code = route_exit_code(&run);
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "run": run,
+            "summary": summary,
+            "saved": !args.no_save,
+        }))?;
+    } else {
+        print_route_run(&run);
+        print_route_summary(&summary, !args.no_save);
+    }
+    Ok(exit_code)
+}
+
+fn run_route_history(args: RouteHistoryArgs, config: &Config, json_output: bool) -> Result<i32> {
+    let mut filter = RouteHistoryFilter {
+        limit: args.limit,
+        ..RouteHistoryFilter::default()
+    };
+    if let Some(target) = args.target {
+        match target.parse::<std::net::IpAddr>() {
+            Ok(ip) => filter.target = Some(ip),
+            Err(error) => {
+                eprintln!("error: {target:?} is not a valid IP address: {error}");
+                return Ok(EXIT_USAGE);
+            }
+        }
+    }
+    if let Some(method) = args.method {
+        match method.parse::<RouteProbeMethod>() {
+            Ok(method) => filter.method = Some(method),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return Ok(EXIT_USAGE);
+            }
+        }
+    }
+    if filter.limit == 0 {
+        eprintln!("error: --limit must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+
+    let store = Store::open(&config.db_path)?;
+    let runs = route::history(&store, &filter)?;
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "history": runs,
+            "filter": {
+                "target": filter.target.map(|value| value.to_string()),
+                "method": filter.method.map(|value| value.as_str()),
+                "limit": filter.limit,
+            }
+        }))?;
+    } else if runs.is_empty() {
+        println!("No route measurements match this filter.");
+    } else {
+        print_route_history(&runs);
+    }
+    Ok(EXIT_OK)
+}
+
+fn run_route_compare(args: RouteCompareArgs, config: &Config, json_output: bool) -> Result<i32> {
+    let method = match args.method.parse::<RouteProbeMethod>() {
+        Ok(method) => method,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Ok(EXIT_USAGE);
+        }
+    };
+    let store = Store::open(&config.db_path)?;
+
+    // Resolve target to an IPv4 address when possible by looking at stored runs.
+    let target_ip = if let Ok(ip) = args.target.parse::<std::net::IpAddr>() {
+        ip
+    } else {
+        let runs = store.list_route_runs(None, Some(method), 200)?;
+        match runs
+            .into_iter()
+            .find(|run| run.target.eq_ignore_ascii_case(&args.target))
+            .map(|run| run.target_ip)
+        {
+            Some(ip) => ip,
+            None => {
+                eprintln!(
+                    "error: could not find stored route runs for {:?}; run `netatlas route trace {}` first or pass an IPv4 address",
+                    args.target, args.target
+                );
+                return Ok(EXIT_NOT_FOUND);
+            }
+        }
+    };
+
+    let against_run = match args.against_run {
+        Some(value) => match Uuid::parse_str(&value) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                eprintln!("error: {value:?} is not a valid run UUID");
+                return Ok(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+
+    let port = match method {
+        RouteProbeMethod::Icmp => None,
+        RouteProbeMethod::Udp | RouteProbeMethod::Tcp => Some(args.port),
+    };
+    let comparison = route::compare(&store, target_ip, method, port, against_run)?;
+    let Some(comparison) = comparison else {
+        if json_output {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "comparison": Value::Null,
+                "note": "Not enough comparable route runs were found. Run at least two traces with the same target, method, and port."
+            }))?;
+        } else {
+            println!(
+                "Not enough comparable route runs were found. Run at least two traces with the same target, method, and port."
+            );
+        }
+        return Ok(EXIT_NOT_FOUND);
+    };
+
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "comparison": comparison,
+        }))?;
+    } else {
+        print_route_comparison(&comparison);
+    }
+    Ok(EXIT_OK)
+}
+
+fn route_exit_code(run: &RouteRun) -> i32 {
+    match run.status {
+        RouteRunStatus::Completed => EXIT_OK,
+        RouteRunStatus::Partial | RouteRunStatus::NoResponse | RouteRunStatus::Cancelled => {
+            EXIT_PARTIAL
+        }
+        RouteRunStatus::Failed => EXIT_OPERATIONAL,
+    }
+}
+
+fn print_route_run(run: &RouteRun) {
+    println!("Route to {} ({})", run.target, run.target_ip);
+    println!(
+        "  method {}{}  status {}  target {}  hops {}  samples {}  timeouts {}",
+        run.method.as_str(),
+        run.port.map(|port| format!(":{port}")).unwrap_or_default(),
+        run.status.as_str(),
+        if run.target_reached {
+            "reached"
+        } else {
+            "not reached"
+        },
+        run.hops.len(),
+        run.sample_count(),
+        run.timeout_count()
+    );
+    if let Some(error) = &run.error {
+        println!("  error: {error}");
+    }
+    println!();
+    let mut rows = Vec::new();
+    for hop in &run.hops {
+        rows.push(route_hop_row(hop));
+    }
+    print_table(
+        &[
+            "TTL", "HOP", "HOSTNAME", "BEST", "AVG", "LOSS", "SAMPLES", "TIMEOUTS",
+        ],
+        rows,
+    );
+    if !run.target_reached {
+        println!(
+            "\nNote: the target was not reached within the probe window. A non-responsive hop is a measurement, not proof that the route is broken."
+        );
+    }
+}
+
+fn route_hop_row(hop: &RouteHop) -> Vec<String> {
+    let responder = hop
+        .responder
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "*".to_string());
+    let hostname = hop.hostname.clone().unwrap_or_else(|| "-".to_string());
+    let best = hop
+        .best_rtt_ms
+        .map(|value| format!("{value:.2} ms"))
+        .unwrap_or_else(|| "-".to_string());
+    let avg = hop
+        .avg_rtt_ms
+        .map(|value| format!("{value:.2} ms"))
+        .unwrap_or_else(|| "-".to_string());
+    vec![
+        hop.ttl.to_string(),
+        responder,
+        hostname,
+        best,
+        avg,
+        format!("{:.0}%", hop.loss_ratio * 100.0),
+        hop.sample_count().to_string(),
+        hop.timeout_count.to_string(),
+    ]
+}
+
+fn print_route_summary(summary: &RouteRunSummary, saved: bool) {
+    println!();
+    println!(
+        "Summary: {} hop(s), {} sample(s), {} timeout(s), {} ms.{}",
+        summary.hop_count,
+        summary.sample_count,
+        summary.timeout_count,
+        summary.elapsed_ms,
+        if saved {
+            " Measurement saved."
+        } else {
+            " Measurement not saved."
+        }
+    );
+    println!(
+        "Note: hop responders, RTTs, and loss are point-in-time measurements; a timeout means no response was received within the probe window."
+    );
+}
+
+fn print_route_history(runs: &[RouteRun]) {
+    let mut rows = Vec::new();
+    for run in runs {
+        rows.push(vec![
+            format_short(run.started_at_ms),
+            run.target.clone(),
+            run.target_ip.to_string(),
+            run.method.as_str().to_string(),
+            run.port
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            run.status.as_str().to_string(),
+            if run.target_reached { "yes" } else { "no" }.to_string(),
+            run.hops.len().to_string(),
+            run.sample_count().to_string(),
+        ]);
+    }
+    print_table(
+        &[
+            "TIME", "TARGET", "IP", "METHOD", "PORT", "STATUS", "REACHED", "HOPS", "SAMPLES",
+        ],
+        rows,
+    );
+}
+
+fn print_route_comparison(comparison: &RouteComparison) {
+    println!(
+        "Route comparison for {} ({}) method {}{}",
+        comparison.target,
+        comparison.target_ip,
+        comparison.method.as_str(),
+        comparison
+            .port
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default()
+    );
+    println!(
+        "  comparable {}  route changed {}  hop count changed {}  RTT changed {}  loss changed {}",
+        yes_no(comparison.comparable),
+        yes_no(comparison.route_changed),
+        yes_no(comparison.hop_count_changed),
+        yes_no(comparison.rtt_changed),
+        yes_no(comparison.loss_changed)
+    );
+    println!(
+        "  target reached: left {}  right {}",
+        yes_no(comparison.target_reached_left),
+        yes_no(comparison.target_reached_right)
+    );
+    println!("  left run:  {}", comparison.left_run_id);
+    println!("  right run: {}", comparison.right_run_id);
+    for note in &comparison.notes {
+        println!("  note: {note}");
+    }
 }
 
 fn install_cancel_handler(token: &CancellationToken) {

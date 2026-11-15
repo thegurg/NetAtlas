@@ -12,6 +12,7 @@ pub mod inference;
 pub mod inventory;
 pub mod network;
 pub mod observation;
+pub mod route;
 pub mod service;
 pub mod time;
 
@@ -40,5 +41,9 @@ pub use observation::{
     HostObservation, HostProbe, HostnameObservation, MdnsServiceObservation, NetbiosObservation,
     ObservationKind, ObservationRecord, ProtocolObservation, ServiceObservation, Source,
     SubjectType, TcpProbe, TcpProbeOutcome, UpnpObservation,
+};
+pub use route::{
+    RouteComparison, RouteHop, RouteProbeMethod, RouteProbeOutcome, RouteRun, RouteRunStatus,
+    RouteSample, aggregate_hop, compare_runs, responder_addresses,
 };
 pub use service::{ServiceRecord, Transport};

@@ -6,3 +6,4 @@ pub mod identify;
 pub mod identity;
 pub mod inventory;
 pub mod model;
+pub mod route;

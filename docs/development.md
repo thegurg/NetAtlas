@@ -1,7 +1,7 @@
 # NetAtlas development guide
 
-Status: Phase 4 (DNS diagnostics) implemented. The TUI, route exploration, monitoring,
-import/export, and cryptographic DNSSEC validation are not implemented yet.
+Status: Phase 5 (route explorer) implemented. The TUI, monitoring, import/export, and
+cryptographic DNSSEC validation are not implemented yet.
 
 ## 1. Environment baseline
 
@@ -50,6 +50,10 @@ cargo run -- oui lookup 3c:cd:5d:11:22:33
 cargo run -- dns query example.com --type A,AAAA --json
 cargo run -- dns compare example.com --type A --resolver system --resolver 1.1.1.1
 cargo run -- dns history --name example.com --limit 10
+cargo run -- route trace example.com
+cargo run -- route trace 1.1.1.1 --method icmp --max-hops 20 --probes 2 --timeout-ms 1000
+cargo run -- route history --json
+cargo run -- route compare example.com --method udp --json
 ```
 
 Live-network checks are opt-in and must never run during ordinary `cargo test`. The
@@ -91,6 +95,8 @@ Versions verified against crates.io on 2026-11-11.
 | `rtnetlink` | 0.24.0 | Links, addresses, routes, neighbour table |
 | `surge-ping` | 0.9.1 | Unprivileged ICMP echo |
 | `hickory-resolver` | 0.26.3 | Reverse DNS, system resolver configuration, and DNS protocol types |
+| `libc` | 0.2.191 | Linux socket options, `IP_RECVERR`, and error-queue parsing for route probes |
+| `socket2` | 0.6.5 | Typed socket creation/configuration for route probes |
 | `mdns-sd` | 0.21.7 | Bounded mDNS/DNS-SD browse and service resolution |
 | `roxmltree` | 0.21.2 | Bounded UPnP device-description XML parsing |
 | `futures-util` | 0.3.31 | Bounded `buffer_unordered` probe scheduling |
@@ -110,9 +116,9 @@ Dev dependencies: `tempfile` 3.27, `assert_cmd` 2.2, `predicates` 3.1.
   unnecessary dependency and keeps local-admin handling explicit.
 - `directories`: XDG resolution is a few lines.
 - `refinery` or another migration framework: a small ordered SQL runner is sufficient.
-- `async-trait` and `socket2`: Phase 2 calls adapters directly and uses Tokio's TCP
-  timeouts. A provider trait will be introduced only when more providers need uniform
-  scheduling.
+- `async-trait`: providers are called directly. A provider trait will be introduced only
+  when more providers need uniform scheduling. Route probing uses `socket2` and `libc`
+  for unprivileged Linux `IP_RECVERR` hop discovery.
 
 ### Deferred dependencies
 
@@ -137,6 +143,8 @@ src/
     service.rs            transport and persisted service records
     evidence.rs           evidence records and properties
     inference.rs          aggregation, conflict, unknown reasons
+    dns.rs                DNS queries, response codes, measurements, comparison
+    route.rs              route probes, hops, runs, aggregation, comparison
     confidence.rs         qualitative confidence rubric
     error.rs              domain errors
   application/
@@ -144,11 +152,14 @@ src/
     discovery.rs          scope resolution, provider scheduling, persistence
     identity.rs           identity resolution v1
     identify.rs           evidence extraction and inference
+    route.rs              trace/history/compare/persist orchestration
   infrastructure/
     netlink.rs            links, addresses, routes, neighbour table
     icmp.rs               ICMP echo provider
     tcp_probe.rs          bounded TCP connect fallback
     reverse_dns.rs        PTR lookup adapter
+    dns.rs                raw UDP/TCP DNS client with RCODE/flags/TTL capture
+    route.rs              unprivileged ICMP/UDP/TCP hop probing via IP_RECVERR
     mdns.rs               bounded mDNS/DNS-SD browse adapter
     ssdp.rs               SSDP M-SEARCH and bounded UPnP description fetch
     netbios.rs            wildcard NBSTAT name queries
@@ -191,8 +202,11 @@ Standards:
 | DNS domain | Record-type/RCODE parsing, DNSSEC states, TTL/case-insensitive comparison, transport-failure handling | `src/domain/dns.rs` |
 | DNS transport | Local mock UDP/TCP servers, RCODE/TTL/flags capture, truncation fallback, timeout, cancellation, resolver/name parsing | `src/infrastructure/dns.rs` |
 | DNS application | Grouping by record type, comparison summary, history filter defaults | `src/application/dns.rs` |
-| SQLite | `:memory:` migrations, OUI import/lookup, scan/service/snapshot/DNS round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
-| CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, filters, map/changes/history, OUI import/lookup, DNS query/compare/history | `tests/cli.rs` |
+| Route domain | Probe/method/status parsing, hop aggregation, sample/loss accounting, comparison rules | `src/domain/route.rs` |
+| Route transport | Unprivileged loopback ICMP/UDP traces, `IP_RECVERR` layout assumptions, option construction | `src/infrastructure/route.rs` |
+| Route application | History filter defaults and run summaries | `src/application/route.rs` |
+| SQLite | `:memory:` migrations, OUI import/lookup, scan/service/snapshot/DNS/route round-trip, strong identifiers | `src/infrastructure/storage/mod.rs` |
+| CLI | `assert_cmd` with a temp data dir; help, JSON, exit codes, filters, map/changes/history, OUI import/lookup, DNS query/compare/history, route trace/history/compare | `tests/cli.rs` |
 
 ### Fixtures
 
@@ -320,10 +334,27 @@ Phase 4 limitations: no cryptographic DNSSEC validation, DoT/DoH, CNAME-chain wa
 scheduled DNS monitoring, or retention job; only seven record types are modelled; DNS
 results are point-in-time and resolver-specific.
 
-### Phase 5 — route explorer (next)
+### Phase 5 — route explorer (done)
 
-Deliverables: ICMP/UDP/TCP traceroute, configurable hops/timeouts/probes, RTT and loss
-with sample counts, reverse DNS, route comparison.
+Deliverables implemented:
+
+- Migration `0004_route` with `route_runs` and `route_hops` (including serialized
+  per-probe samples).
+- Unprivileged ICMP datagram, UDP, and TCP route probing using per-hop TTL and
+  `IP_RECVERR` error-queue hop discovery (no raw sockets, no `CAP_NET_RAW`).
+- Configurable target, method, port, max hops, probes per hop, timeout, and concurrency,
+  with cancellation and bounded execution.
+- Per-hop responder address, reverse-DNS hostname hint, reply/timeout/error counts,
+  best/average RTT, loss ratio, and preserved sample counts.
+- Route history and derived comparison of runs with the same target IP, method, and port.
+- CLI commands `route trace`, `route history`, and `route compare`, with text/JSON
+  output and documented exit codes.
+- Deterministic domain/storage/CLI tests plus loopback transport tests.
+
+Phase 5 limitations: IPv4 only; no raw-socket mode, MPLS/ICMP extension parsing, path MTU
+discovery, AS/geo enrichment, or continuous route monitoring. Hop discovery depends on
+`IP_RECVERR` and environment ICMP permissions. Non-responsive hops and route variability
+are reported as measurements, never as proof of a broken route.
 
 ### Phase 6 — monitoring and import/export
 

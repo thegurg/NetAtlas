@@ -41,6 +41,7 @@ fn help_lists_available_commands() {
         "history",
         "oui",
         "dns",
+        "route",
     ] {
         assert!(stdout.contains(expected), "help did not mention {expected}");
     }
@@ -405,4 +406,94 @@ fn dns_history_without_measurements_is_empty() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["history"], Value::Array(Vec::new()));
+}
+
+#[test]
+fn route_history_without_measurements_is_empty() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args(["route", "history", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["history"], Value::Array(Vec::new()));
+}
+
+#[test]
+fn invalid_route_method_is_a_usage_error() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args([
+            "route",
+            "trace",
+            "127.0.0.1",
+            "--method",
+            "bogus",
+            "--no-save",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid route probe method"));
+}
+
+#[test]
+fn route_compare_without_runs_is_not_found() {
+    let (_dir, mut command, _db) = command();
+    let output = command
+        .args(["route", "compare", "127.0.0.1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+}
+
+#[test]
+fn route_trace_loopback_round_trips_and_history_shows_run() {
+    let (dir, mut command, _db) = command();
+    let output = command
+        .args([
+            "route",
+            "trace",
+            "127.0.0.1",
+            "--method",
+            "udp",
+            "--max-hops",
+            "1",
+            "--probes",
+            "1",
+            "--timeout-ms",
+            "500",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() || output.status.code() == Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["saved"], true);
+    assert_eq!(value["summary"]["target_reached"], true);
+    assert_eq!(value["run"]["target_reached"], true);
+
+    let (mut history_command, _db) = command_in(&dir);
+    let history = history_command
+        .args(["route", "history", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        history.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+    let history_value: Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history_value["history"].as_array().unwrap().len(), 1);
 }

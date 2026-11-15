@@ -144,9 +144,11 @@ SQLite migration `0001_discovery` stores interfaces, addresses, segments, scan s
 devices, identifiers, observations, evidence, inferences, identity links, services, and
 OUI sources/prefixes. Migration `0002_inventory` adds per-session device snapshots used
 for history and change detection. Migration `0003_dns` adds `dns_measurements` for raw
-DNS query results, timing, RCODEs, and explicit DNSSEC observation state. Foreign keys
-and WAL are enabled. The IEEE MA-L/MA-M/MA-S snapshot under `data/oui/` is embedded in
-the binary and imported on first open.
+DNS query results, timing, RCODEs, and explicit DNSSEC observation state. Migration
+`0004_route` adds `route_runs` and `route_hops` for point-in-time route measurements,
+per-hop responder/timing/loss aggregates, and serialized probe samples. Foreign keys and
+WAL are enabled. The IEEE MA-L/MA-M/MA-S snapshot under `data/oui/` is embedded in the
+binary and imported on first open.
 
 ## Current limitations
 
@@ -176,12 +178,16 @@ the binary and imported on first open.
 - DNSSEC validation is not implemented. The AD flag and RRSIG presence are observations,
   not a local validation result.
 - No DNS-over-TLS, DNS-over-HTTPS, scheduled DNS monitoring, or CNAME-chain walking yet.
+- Route history begins with the first measurement recorded after migration `0004_route`.
+  Route runs are IPv4-only point-in-time measurements; timeouts and missing responders
+  are not proof that a route is broken. Unprivileged ICMP/UDP/TCP probing depends on the
+  environment (`IP_RECVERR` and ICMP datagram permissions).
 - Segment grouping uses the most recently seen address for each device and the prefixes
   recorded from network context. It does not infer physical topology, VLANs, or
   switch/AP attachment.
 - Stale records are not offline devices. A device can be present but unobserved because
   of sleep, firewall rules, client isolation, or scope limits.
-- No TUI, traceroute, monitoring, or import/export yet.
+- No TUI, monitoring, or import/export yet.
 - No live-network tests run during `cargo test`; they are opt-in only.
 
 ## Build and test
@@ -220,6 +226,7 @@ behavior. They do not require a live network.
 | [docs/identification.md](docs/identification.md) | Identification pipeline, evidence reliability, confidence rubric, acceptance tests |
 | [docs/inventory.md](docs/inventory.md) | Inventory snapshots, history, change semantics, segment map, freshness |
 | [docs/dns.md](docs/dns.md) | DNS queries, resolver selection, comparison, exit codes, DNSSEC honesty, history |
+| [docs/route.md](docs/route.md) | Route tracing, hop/loss/RTT semantics, comparison, and limitations |
 | [docs/development.md](docs/development.md) | Toolchain, dependencies, testing policy, coding standards, roadmap |
 
 ## Safety
