@@ -22,14 +22,14 @@ use self::event::AppEvent;
 const TICK_RATE: Duration = Duration::from_millis(250);
 
 /// Run the interactive TUI.
-pub fn run(config: &Config) -> Result<()> {
+pub async fn run(config: &Config) -> Result<()> {
     let terminal = ratatui::init();
-    let result = run_app(terminal, config);
+    let result = run_app(terminal, config).await;
     ratatui::restore();
     result
 }
 
-fn run_app(mut terminal: DefaultTerminal, config: &Config) -> Result<()> {
+async fn run_app(mut terminal: DefaultTerminal, config: &Config) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(config.clone(), tx.clone())?;
     app.start_initial_load();
@@ -45,7 +45,7 @@ fn run_app(mut terminal: DefaultTerminal, config: &Config) -> Result<()> {
             break;
         }
 
-        match rx.blocking_recv() {
+        match rx.recv().await {
             Some(event) => app.handle_event(event),
             None => break,
         }

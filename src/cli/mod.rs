@@ -656,7 +656,7 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Tui => {
             // TUI is interactive and owns terminal I/O; JSON mode is not applicable.
             let _ = json_output;
-            crate::tui::run(&config)?;
+            crate::tui::run(&config).await?;
             Ok(EXIT_OK)
         }
         Command::Db { command } => run_db(command, &config, json_output),
@@ -1916,7 +1916,7 @@ fn run_import(command: ImportCommand, config: &Config, json_output: bool) -> Res
         ImportCommand::Json { input, dry_run } => {
             let export = import::load_export(&input)?;
             let mut store = Store::open(&config.db_path)?;
-            let report = import::import_json(&mut store, export, dry_run)?;
+            let report = import::import_json(&mut store, export, dry_run, false)?;
             let has_conflicts = !report.conflicts.is_empty();
             if json_output {
                 print_json(&json!({

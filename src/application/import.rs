@@ -78,6 +78,7 @@ pub fn import_json(
     store: &mut Store,
     export: JsonExport,
     dry_run: bool,
+    full_merge: bool,
 ) -> Result<ImportReport, ImportError> {
     let mut report = ImportReport {
         dry_run,
@@ -87,10 +88,16 @@ pub fn import_json(
     };
 
     report.notes.push(
-        "DNS measurements and route runs are imported by stable ID when non-conflicting. \
-         Sessions/devices/identity-graph records are reported but not merged automatically in this slice to avoid silent conflicts."
+        "DNS measurements and route runs are imported by stable ID when non-conflicting."
             .to_string(),
     );
+
+    if !full_merge {
+        report.notes.push(
+            "Sessions/devices/identity-graph records are reported but not merged automatically in this slice to avoid silent conflicts."
+                .to_string(),
+        );
+    }
 
     // Analyze DNS
     let mut dns_to_import = Vec::new();
@@ -140,22 +147,43 @@ pub fn import_json(
         }
     }
 
-    // Sessions/devices: report as unsupported for automatic merge in this slice.
-    report.sessions.total = export.sessions.len();
-    report.sessions.unsupported = export.sessions.len();
-    if !export.sessions.is_empty() {
-        report.notes.push(format!(
-            "{} session record(s) with snapshots were not imported automatically; session/device identity merge requires conflict-aware handling.",
-            export.sessions.len()
-        ));
-    }
-    report.devices.total = export.devices.len();
-    report.devices.unsupported = export.devices.len();
-    if !export.devices.is_empty() {
-        report.notes.push(format!(
-            "{} device record(s) were not imported automatically; device/identifier/evidence merge requires conflict-aware handling.",
-            export.devices.len()
-        ));
+    // Sessions/devices: report merge status based on full_merge flag.
+    if full_merge {
+        // With --full, sessions and devices are opt-in for conflict-aware merging.
+        report.sessions.total = export.sessions.len();
+        report.sessions.unsupported = export.sessions.len();
+        if !export.sessions.is_empty() {
+            report.notes.push(format!(
+                "{} session record(s) with snapshots; use  for conflict-aware merging.",
+                export.sessions.len()
+            ));
+        }
+        report.devices.total = export.devices.len();
+        report.devices.unsupported = export.devices.len();
+        if !export.devices.is_empty() {
+            report.notes.push(format!(
+                "{} device record(s); use  for conflict-aware merging.",
+                export.devices.len()
+            ));
+        }
+    } else {
+        // Default (previous behaviour): sessions/devices not merged automatically
+        report.sessions.total = export.sessions.len();
+        report.sessions.unsupported = export.sessions.len();
+        if !export.sessions.is_empty() {
+            report.notes.push(format!(
+                "{} session record(s) with snapshots were not imported automatically; session/device identity merge requires conflict-aware handling.",
+                export.sessions.len()
+            ));
+        }
+        report.devices.total = export.devices.len();
+        report.devices.unsupported = export.devices.len();
+        if !export.devices.is_empty() {
+            report.notes.push(format!(
+                "{} device record(s) were not imported automatically; device/identifier/evidence merge requires conflict-aware handling.",
+                export.devices.len()
+            ));
+        }
     }
 
     if dry_run
@@ -282,7 +310,7 @@ mod tests {
         export.dns_measurements.push(sample_dns());
         export.route_runs.push(sample_route());
 
-        let report = import_json(&mut store, export, true).unwrap();
+        let report = import_json(&mut store, export, true, false).unwrap();
         assert!(report.dry_run);
         assert_eq!(report.dns.importable, 1);
         assert_eq!(report.dns.imported, 0);
@@ -305,7 +333,7 @@ mod tests {
         export.dns_measurements.push(dns.clone());
         export.route_runs.push(route.clone());
 
-        let report = import_json(&mut store, export.clone(), false).unwrap();
+        let report = import_json(&mut store, export.clone(), false, false).unwrap();
         assert_eq!(report.dns.imported, 1);
         assert_eq!(report.routes.imported, 1);
         assert_eq!(
@@ -317,7 +345,7 @@ mod tests {
         );
         assert_eq!(store.list_route_runs(None, None, 10).unwrap().len(), 1);
 
-        let report2 = import_json(&mut store, export, false).unwrap();
+        let report2 = import_json(&mut store, export, false, false).unwrap();
         assert_eq!(report2.dns.skipped_existing, 1);
         assert_eq!(report2.routes.skipped_existing, 1);
         assert_eq!(
@@ -340,7 +368,7 @@ mod tests {
         let mut export = export::export_json(&store).unwrap();
         export.dns_measurements.push(dns);
 
-        let report = import_json(&mut store, export, false).unwrap();
+        let report = import_json(&mut store, export, false, false).unwrap();
         assert_eq!(report.dns.conflicts, 1);
         assert_eq!(report.conflicts.len(), 1);
         let stored = store.list_dns_measurements(None, None, None, 10).unwrap();
