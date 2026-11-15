@@ -64,6 +64,32 @@ pub struct OuiImportReport {
     pub content_sha256: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MonitorRunRow {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub target: Option<String>,
+    pub config_json: String,
+    pub summary_json: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkEventRow {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub kind: String,
+    pub severity: String,
+    pub subject_type: Option<String>,
+    pub subject_id: Option<String>,
+    pub message: String,
+    pub details_json: String,
+    pub observed_at_ms: i64,
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -104,11 +130,18 @@ impl Store {
     /// Mark scan sessions left in `running` state by a previous process as `interrupted`.
     /// Their observations remain valid; only the session lifecycle state is corrected.
     fn mark_stale_running_sessions_interrupted(&mut self) -> Result<(), StorageError> {
+        let now = crate::domain::time::now_ms();
         self.connection.execute(
             "UPDATE scan_sessions
              SET status = 'interrupted', finished_at_ms = COALESCE(finished_at_ms, ?1)
              WHERE status = 'running'",
-            params![crate::domain::time::now_ms()],
+            params![now],
+        )?;
+        self.connection.execute(
+            "UPDATE monitor_runs
+             SET status = 'interrupted', finished_at_ms = COALESCE(finished_at_ms, ?1)
+             WHERE status = 'running'",
+            params![now],
         )?;
         Ok(())
     }
@@ -1384,6 +1417,139 @@ impl Store {
         run.map(|run| self.load_route_hops(run)).transpose()
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors monitor_runs schema columns for a single INSERT.
+    pub fn insert_monitor_run(
+        &mut self,
+        id: &str,
+        kind: &str,
+        status: &str,
+        started_at_ms: i64,
+        finished_at_ms: Option<i64>,
+        target: Option<&str>,
+        config_json: &str,
+        summary_json: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO monitor_runs
+             (id, kind, status, started_at_ms, finished_at_ms, target, config_json, summary_json, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id, kind, status, started_at_ms, finished_at_ms, target, config_json, summary_json, error
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_monitor_run(
+        &mut self,
+        id: &str,
+        status: &str,
+        finished_at_ms: Option<i64>,
+        summary_json: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE monitor_runs
+             SET status = ?2, finished_at_ms = ?3, summary_json = COALESCE(?4, summary_json), error = ?5
+             WHERE id = ?1",
+            params![id, status, finished_at_ms, summary_json, error],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors network_events schema columns for a single INSERT.
+    pub fn insert_network_event(
+        &mut self,
+        id: &str,
+        run_id: Option<&str>,
+        kind: &str,
+        severity: &str,
+        subject_type: Option<&str>,
+        subject_id: Option<&str>,
+        message: &str,
+        details_json: &str,
+        observed_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO network_events
+             (id, run_id, kind, severity, subject_type, subject_id, message, details_json, observed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id, run_id, kind, severity, subject_type, subject_id, message, details_json, observed_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_monitor_runs(
+        &self,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MonitorRunRow>, StorageError> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(1_000);
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, status, started_at_ms, finished_at_ms, target, config_json, summary_json, error
+             FROM monitor_runs
+             WHERE (?1 IS NULL OR kind = ?1)
+             ORDER BY started_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![kind, limit], |row| {
+            Ok(MonitorRunRow {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                status: row.get(2)?,
+                started_at_ms: row.get(3)?,
+                finished_at_ms: row.get(4)?,
+                target: row.get(5)?,
+                config_json: row.get(6)?,
+                summary_json: row.get(7)?,
+                error: row.get(8)?,
+            })
+        })?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
+    pub fn list_network_events(
+        &self,
+        run_id: Option<&str>,
+        severity: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<NetworkEventRow>, StorageError> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(1_000);
+        let mut statement = self.connection.prepare(
+            "SELECT id, run_id, kind, severity, subject_type, subject_id, message, details_json, observed_at_ms
+             FROM network_events
+             WHERE (?1 IS NULL OR run_id = ?1)
+               AND (?2 IS NULL OR severity = ?2)
+             ORDER BY observed_at_ms DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![run_id, severity, limit], |row| {
+            Ok(NetworkEventRow {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                kind: row.get(2)?,
+                severity: row.get(3)?,
+                subject_type: row.get(4)?,
+                subject_id: row.get(5)?,
+                message: row.get(6)?,
+                details_json: row.get(7)?,
+                observed_at_ms: row.get(8)?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     fn load_route_hops(&self, mut run: RouteRun) -> Result<RouteRun, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT ttl, responder, hostname, samples_json, reply_count, timeout_count, error_count,
@@ -1898,7 +2064,7 @@ mod tests {
         let device_id = scan.devices[0].id;
         store.save_scan(&scan).unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
 
         let devices = store.list_devices(None).unwrap();
         assert_eq!(devices.len(), 1);
@@ -2191,7 +2357,7 @@ mod tests {
         run.hops[0].hostname = Some("gateway.local".to_string());
 
         store.save_route_run(&run).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
 
         let listed = store.list_route_runs(None, None, 10).unwrap();
         assert_eq!(listed.len(), 1);

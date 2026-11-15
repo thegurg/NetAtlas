@@ -731,3 +731,32 @@ fn import_json_dry_run_and_apply_route_measurement() {
             >= 1
     );
 }
+
+#[test]
+fn monitor_runs_and_events_empty() {
+    let (_dir, mut runs_command, _db) = command();
+    let output = runs_command
+        .args(["monitor", "runs", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["monitor_runs"], Value::Array(Vec::new()));
+
+    let (_dir, mut events_command, _db) = command();
+    let output = events_command
+        .args(["monitor", "events", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["network_events"], Value::Array(Vec::new()));
+}

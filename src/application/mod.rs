@@ -8,4 +8,5 @@ pub mod identity;
 pub mod import;
 pub mod inventory;
 pub mod model;
+pub mod monitor;
 pub mod route;

@@ -40,6 +40,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_route",
         sql: include_str!("migrations/0004_route.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_monitoring",
+        sql: include_str!("migrations/0005_monitoring.sql"),
+    },
 ];
 
 pub fn supported_version() -> i64 {

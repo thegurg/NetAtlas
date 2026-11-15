@@ -23,6 +23,7 @@ use crate::application::export;
 use crate::application::import;
 use crate::application::inventory::{self, ChangeReport, DeviceFilter, DeviceHistory, SegmentMap};
 use crate::application::model::{ScanResult, SessionStatus};
+use crate::application::monitor::{self, EventFilter, MonitorRunFilter};
 use crate::application::route::{self, RouteHistoryFilter, RouteOptions, RouteRunSummary};
 use crate::config::Config;
 use crate::domain::time::format_short;
@@ -105,6 +106,11 @@ enum Command {
     Import {
         #[command(subcommand)]
         command: ImportCommand,
+    },
+    /// Run and inspect opt-in monitoring checks.
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
     },
     /// Database maintenance operations.
     Db {
@@ -363,6 +369,51 @@ enum ExportCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum MonitorCommand {
+    /// Run a discovery scan as a monitored check and record derived network events.
+    Scan(MonitorScanArgs),
+    /// List recorded monitor runs.
+    Runs(MonitorRunsArgs),
+    /// List recorded network events.
+    Events(MonitorEventsArgs),
+}
+
+#[derive(Debug, Args)]
+struct MonitorScanArgs {
+    #[command(flatten)]
+    discover: DiscoverArgs,
+    /// Repeat the monitored scan every N seconds until cancelled.
+    #[arg(long, value_name = "SECONDS")]
+    interval_seconds: Option<u64>,
+    /// Maximum number of scan iterations (default: unlimited when interval is set, 1 otherwise).
+    #[arg(long, value_name = "N")]
+    iterations: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct MonitorRunsArgs {
+    /// Restrict to a monitor kind (scan, dns).
+    #[arg(long)]
+    kind: Option<String>,
+    /// Maximum number of runs to show.
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct MonitorEventsArgs {
+    /// Restrict to events from one monitor run.
+    #[arg(long, value_name = "UUID")]
+    run: Option<String>,
+    /// Restrict to a severity (info, warning, change, error).
+    #[arg(long)]
+    severity: Option<String>,
+    /// Maximum number of events to show.
+    #[arg(long, default_value_t = 100, value_name = "N")]
+    limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
 enum ImportCommand {
     /// Validate and optionally import a JSON export bundle.
     /// Imports non-conflicting DNS measurements and route runs by stable ID.
@@ -431,36 +482,13 @@ async fn execute(cli: Cli) -> Result<i32> {
         }
         Command::Discover(args) => {
             let mut store = Store::open(&config.db_path)?;
-            let mut options = ScanOptions::from_config(&config);
-            options.interface = args.interface;
-            options.target = args.target;
-            if let Some(timeout) = args.timeout_ms {
-                options.timeout_ms = timeout;
-            }
-            if let Some(timeout) = args.dns_timeout_ms {
-                options.dns_timeout_ms = timeout;
-            }
-            if let Some(concurrency) = args.concurrency {
-                options.concurrency = concurrency;
-            }
-            if let Some(max_hosts) = args.max_hosts {
-                options.max_hosts = max_hosts;
-            }
-            if let Some(window) = args.mdns_window_ms {
-                options.mdns_window_ms = window;
-            }
-            options.enable_icmp = !args.no_icmp;
-            options.enable_tcp = !args.no_tcp;
-            options.enable_dns = !args.no_dns;
-            options.enable_mdns = !args.no_mdns;
-            options.enable_ssdp = !args.no_ssdp;
-            options.enable_netbios = !args.no_netbios;
-            options.enable_services = !args.no_services;
-
-            if let Err(error) = options.validate() {
-                eprintln!("error: {error}");
-                return Ok(EXIT_USAGE);
-            }
+            let options = match discover_args_to_options(args, &config) {
+                Ok(options) => options,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    return Ok(EXIT_USAGE);
+                }
+            };
 
             let cancel = CancellationToken::new();
             install_cancel_handler(&cancel);
@@ -622,6 +650,7 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Route { command } => run_route(command, &config, json_output).await,
         Command::Export { command } => run_export(command, &config, json_output),
         Command::Import { command } => run_import(command, &config, json_output),
+        Command::Monitor { command } => run_monitor(command, &config, json_output).await,
         Command::Db { command } => run_db(command, &config, json_output),
     }
 }
@@ -1175,6 +1204,297 @@ fn dns_flag_labels(flags: &DnsFlags) -> String {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+fn discover_args_to_options(
+    args: DiscoverArgs,
+    config: &Config,
+) -> std::result::Result<ScanOptions, String> {
+    let mut options = ScanOptions::from_config(config);
+    options.interface = args.interface;
+    options.target = args.target;
+    if let Some(timeout) = args.timeout_ms {
+        options.timeout_ms = timeout;
+    }
+    if let Some(timeout) = args.dns_timeout_ms {
+        options.dns_timeout_ms = timeout;
+    }
+    if let Some(concurrency) = args.concurrency {
+        options.concurrency = concurrency;
+    }
+    if let Some(max_hosts) = args.max_hosts {
+        options.max_hosts = max_hosts;
+    }
+    if let Some(window) = args.mdns_window_ms {
+        options.mdns_window_ms = window;
+    }
+    options.enable_icmp = !args.no_icmp;
+    options.enable_tcp = !args.no_tcp;
+    options.enable_dns = !args.no_dns;
+    options.enable_mdns = !args.no_mdns;
+    options.enable_ssdp = !args.no_ssdp;
+    options.enable_netbios = !args.no_netbios;
+    options.enable_services = !args.no_services;
+    options.validate().map_err(|error| error.to_string())?;
+    Ok(options)
+}
+
+async fn run_monitor(command: MonitorCommand, config: &Config, json_output: bool) -> Result<i32> {
+    match command {
+        MonitorCommand::Scan(args) => run_monitor_scan(args, config, json_output).await,
+        MonitorCommand::Runs(args) => run_monitor_runs(args, config, json_output),
+        MonitorCommand::Events(args) => run_monitor_events(args, config, json_output),
+    }
+}
+
+async fn run_monitor_scan(
+    args: MonitorScanArgs,
+    config: &Config,
+    json_output: bool,
+) -> Result<i32> {
+    let options = match discover_args_to_options(args.discover, config) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return Ok(EXIT_USAGE);
+        }
+    };
+    if let Some(interval) = args.interval_seconds
+        && interval == 0
+    {
+        eprintln!("error: --interval-seconds must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+    let iterations = args.iterations.unwrap_or_else(|| {
+        if args.interval_seconds.is_some() {
+            usize::MAX
+        } else {
+            1
+        }
+    });
+    if iterations == 0 {
+        eprintln!("error: --iterations must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+
+    let cancel = CancellationToken::new();
+    install_cancel_handler(&cancel);
+    let mut last_code = EXIT_OK;
+    let mut iteration_results = Vec::new();
+
+    for index in 0..iterations {
+        if cancel.is_cancelled() {
+            last_code = EXIT_PARTIAL;
+            break;
+        }
+        let mut store = Store::open(&config.db_path)?;
+        let result = monitor::run_scan_once(&mut store, options.clone(), cancel.clone()).await;
+        match result {
+            Ok(result) => {
+                last_code = monitor_run_exit_code(result.run.status);
+                if json_output {
+                    iteration_results.push(json!({
+                        "run": result.run,
+                        "events": result.events,
+                        "scan_session_id": result.scan_session_id,
+                    }));
+                } else {
+                    print_monitor_scan_result(&result);
+                }
+            }
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                last_code = EXIT_OPERATIONAL;
+                if json_output {
+                    iteration_results.push(json!({
+                        "error": error.to_string(),
+                    }));
+                }
+            }
+        }
+
+        if index + 1 >= iterations || cancel.is_cancelled() {
+            break;
+        }
+        if let Some(interval) = args.interval_seconds {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    last_code = EXIT_PARTIAL;
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            }
+        }
+    }
+
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "monitor_scan": {
+                "iterations": iteration_results.len(),
+                "results": iteration_results,
+            }
+        }))?;
+    }
+    Ok(last_code)
+}
+
+fn run_monitor_runs(args: MonitorRunsArgs, config: &Config, json_output: bool) -> Result<i32> {
+    let kind = match args.kind {
+        Some(value) => match value.parse::<monitor::MonitorKind>() {
+            Ok(kind) => Some(kind),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return Ok(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+    if args.limit == 0 {
+        eprintln!("error: --limit must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+    let store = Store::open(&config.db_path)?;
+    let runs = monitor::list_runs(
+        &store,
+        &MonitorRunFilter {
+            kind,
+            limit: args.limit,
+        },
+    )?;
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "monitor_runs": runs,
+            "filter": { "kind": kind.map(|v| v.as_str()), "limit": args.limit }
+        }))?;
+    } else if runs.is_empty() {
+        println!("No monitor runs match this filter.");
+    } else {
+        print_monitor_runs(&runs);
+    }
+    Ok(EXIT_OK)
+}
+
+fn run_monitor_events(args: MonitorEventsArgs, config: &Config, json_output: bool) -> Result<i32> {
+    let run_id = match args.run {
+        Some(value) => match Uuid::parse_str(&value) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                eprintln!("error: {value:?} is not a valid run UUID");
+                return Ok(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+    let severity = match args.severity {
+        Some(value) => match value.parse::<monitor::EventSeverity>() {
+            Ok(severity) => Some(severity),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return Ok(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+    if args.limit == 0 {
+        eprintln!("error: --limit must be greater than zero");
+        return Ok(EXIT_USAGE);
+    }
+    let store = Store::open(&config.db_path)?;
+    let events = monitor::list_events(
+        &store,
+        &EventFilter {
+            run_id,
+            severity,
+            limit: args.limit,
+        },
+    )?;
+    if json_output {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "network_events": events,
+            "filter": {
+                "run": run_id.map(|v| v.to_string()),
+                "severity": severity.map(|v| v.as_str()),
+                "limit": args.limit
+            }
+        }))?;
+    } else if events.is_empty() {
+        println!("No network events match this filter.");
+    } else {
+        print_monitor_events(&events);
+    }
+    Ok(EXIT_OK)
+}
+
+fn monitor_run_exit_code(status: monitor::MonitorRunStatus) -> i32 {
+    match status {
+        monitor::MonitorRunStatus::Completed => EXIT_OK,
+        monitor::MonitorRunStatus::Partial
+        | monitor::MonitorRunStatus::Cancelled
+        | monitor::MonitorRunStatus::Interrupted => EXIT_PARTIAL,
+        monitor::MonitorRunStatus::Failed | monitor::MonitorRunStatus::Running => EXIT_OPERATIONAL,
+    }
+}
+
+fn print_monitor_scan_result(result: &monitor::ScanMonitorResult) {
+    println!(
+        "Monitor run {} (scan, {})  session {}  events {}",
+        result.run.id,
+        result.run.status.as_str(),
+        result.scan_session_id,
+        result.events.len()
+    );
+    for event in &result.events {
+        println!(
+            "  [{}] {}  {}",
+            event.severity.as_str(),
+            event.kind,
+            event.message
+        );
+    }
+}
+
+fn print_monitor_runs(runs: &[monitor::MonitorRun]) {
+    let mut rows = Vec::new();
+    for run in runs {
+        rows.push(vec![
+            format_short(run.started_at_ms),
+            run.kind.as_str().to_string(),
+            run.status.as_str().to_string(),
+            run.target.clone().unwrap_or_else(|| "-".to_string()),
+            run.finished_at_ms
+                .map(format_short)
+                .unwrap_or_else(|| "-".to_string()),
+            run.id.to_string(),
+        ]);
+    }
+    print_table(
+        &["STARTED", "KIND", "STATUS", "TARGET", "FINISHED", "RUN_ID"],
+        rows,
+    );
+}
+
+fn print_monitor_events(events: &[monitor::NetworkEvent]) {
+    let mut rows = Vec::new();
+    for event in events {
+        rows.push(vec![
+            format_short(event.observed_at_ms),
+            event.severity.as_str().to_string(),
+            event.kind.clone(),
+            event
+                .subject_type
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            event.subject_id.clone().unwrap_or_else(|| "-".to_string()),
+            event.message.clone(),
+        ]);
+    }
+    print_table(
+        &["TIME", "SEVERITY", "KIND", "SUBJECT", "ID", "MESSAGE"],
+        rows,
+    );
 }
 
 async fn run_route(command: RouteCommand, config: &Config, json_output: bool) -> Result<i32> {

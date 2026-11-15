@@ -1,9 +1,10 @@
 # NetAtlas data model
 
-Status: Phase 5. Migrations `0001_discovery`, `0002_inventory`, `0003_dns`, and
-`0004_route` are implemented and applied automatically. Phase 2 used the existing
-`services` table; Phase 3 adds per-session inventory snapshots; Phase 4 adds DNS
-measurements; Phase 5 adds route runs and hops. Monitoring tables do not exist yet.
+Status: Phase 6 in progress. Migrations `0001_discovery` through `0005_monitoring` are
+implemented and applied automatically. Phase 2 used the existing `services` table; Phase
+3 adds per-session inventory snapshots; Phase 4 adds DNS measurements; Phase 5 adds route
+runs and hops; Phase 6 adds monitor runs and network events (import-report table not yet
+created). Full conflict-aware identity import remains unimplemented.
 
 ## 1. Modeling principles
 
@@ -667,12 +668,38 @@ preserves individual probe outcomes, responder addresses, RTTs, and ICMP type/co
 available; aggregate hop fields are derived from those samples. A timeout is recorded as
 a sample outcome, not as proof that the route is broken.
 
+`0005_monitoring` stores monitoring state:
+
+```sql
+CREATE TABLE monitor_runs (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ('scan','dns')),
+    status          TEXT NOT NULL CHECK (status IN ('running','completed','partial','failed','cancelled','interrupted')),
+    started_at_ms   INTEGER NOT NULL,
+    finished_at_ms  INTEGER,
+    target          TEXT,
+    config_json     TEXT NOT NULL,
+    summary_json    TEXT,
+    error           TEXT
+);
+
+CREATE TABLE network_events (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT REFERENCES monitor_runs(id) ON DELETE SET NULL,
+    kind            TEXT NOT NULL,
+    severity        TEXT NOT NULL CHECK (severity IN ('info','warning','change','error')),
+    subject_type    TEXT,
+    subject_id      TEXT,
+    message         TEXT NOT NULL,
+    details_json    TEXT NOT NULL,
+    observed_at_ms  INTEGER NOT NULL
+);
+```
+
 ### Planned later migrations
 
-- `0005_monitoring.sql`: `network_events`, `monitor_runs`, `import_reports`.
-- Import/export metadata tables if needed for provenance.
-
-These are not created until their modules exist.
+- `import_reports` and/or import/export provenance tables if needed.
+- Additional monitoring/DNS scheduling metadata if required.
 
 ## 6. Migrations and integrity
 

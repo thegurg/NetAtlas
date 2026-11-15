@@ -35,6 +35,9 @@ netatlas export json --output ./netatlas-export.json
 netatlas export csv --output ./devices.csv
 netatlas import json --input ./netatlas-export.json --dry-run
 netatlas import json --input ./netatlas-export.json
+netatlas monitor scan [--target 192.168.1.0/24] [--interval-seconds 300]
+netatlas monitor runs [--kind scan]
+netatlas monitor events [--run <uuid>] [--severity change]
 netatlas db integrity
 netatlas db backup --output ./netatlas-backup.db
 netatlas db restore --input ./netatlas-backup.db [--to ./netatlas-restored.db]
@@ -204,8 +207,9 @@ binary and imported on first open.
   runs by stable ID (conflicts reported, never overwritten). Full conflict-aware import of
   sessions/devices/identifiers/evidence/inference/observation graphs is not implemented yet;
   use `db backup/restore` for full-fidelity restoration.
-- Scheduled monitoring, monitor-run/event storage, and automatic change-detection jobs are
-  not implemented yet.
+- Opt-in scan monitoring is implemented (`monitor scan`/`runs`/`events`) with persisted
+  runs and scan-derived change events; scheduled DNS monitoring checks and richer automated
+  monitoring jobs are not implemented yet.
 - No TUI or cryptographic DNSSEC validation yet.
 - No live-network tests run during `cargo test`; they are opt-in only.
 

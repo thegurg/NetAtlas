@@ -380,16 +380,21 @@ Implemented in this slice:
   non-conflicting DNS measurements and route runs by stable ID, with conflict reporting
   and no overwrites. Sessions/devices/identity-graph records are reported as unsupported
   in this slice (no silent merges).
-- Stale `running` scan sessions are marked `interrupted` on database open.
-- Deterministic application/storage/CLI coverage for export, import, and backup/restore flows.
+- Migration `0005_monitoring` with `monitor_runs` and `network_events`.
+- `monitor scan` runs an opt-in discovery check (one-shot or `--interval-seconds` loop),
+  persists monitor runs, and records derived network events from scan change comparison.
+- `monitor runs` and `monitor events` list persisted monitoring history.
+- Stale `running` scan sessions and monitor runs are marked `interrupted` on database open.
+- Deterministic application/storage/CLI coverage for export, import, backup/restore, and
+  monitoring history/listing flows.
 
 Remaining Phase 6 work:
 
 - Full conflict-aware, transactional import with dry-run for sessions, devices, identifiers,
   evidence, inferences, observations, and services (duplicate detection/conflict reporting,
   no silent merge).
-- Opt-in scheduled scans/DNS checks, monitor-run/event persistence, and change-detection
-  jobs/history beyond on-demand comparisons.
+- Scheduled DNS monitoring checks, richer event taxonomy/jobs, and additional
+  change-detection automation beyond scan-derived events.
 
 ### Phase 7 — TUI
 
