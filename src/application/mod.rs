@@ -5,6 +5,7 @@ pub mod dns;
 pub mod export;
 pub mod identify;
 pub mod identity;
+pub mod import;
 pub mod inventory;
 pub mod model;
 pub mod route;

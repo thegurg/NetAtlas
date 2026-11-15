@@ -20,6 +20,7 @@ use crate::application::dns::{
     self, DnsCompareReport, DnsHistoryFilter, DnsRunSummary, QueryOptions,
 };
 use crate::application::export;
+use crate::application::import;
 use crate::application::inventory::{self, ChangeReport, DeviceFilter, DeviceHistory, SegmentMap};
 use crate::application::model::{ScanResult, SessionStatus};
 use crate::application::route::{self, RouteHistoryFilter, RouteOptions, RouteRunSummary};
@@ -99,6 +100,11 @@ enum Command {
     Export {
         #[command(subcommand)]
         command: ExportCommand,
+    },
+    /// Import a JSON export bundle.
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
     },
     /// Database maintenance operations.
     Db {
@@ -357,6 +363,21 @@ enum ExportCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ImportCommand {
+    /// Validate and optionally import a JSON export bundle.
+    /// Imports non-conflicting DNS measurements and route runs by stable ID.
+    /// Sessions/devices are reported but not merged automatically in this slice.
+    Json {
+        /// Input JSON export file.
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        /// Validate and report without writing to the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum DbCommand {
     /// Create a consistent SQLite backup and verify its integrity.
     Backup {
@@ -600,6 +621,7 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Dns { command } => run_dns(command, &config, json_output).await,
         Command::Route { command } => run_route(command, &config, json_output).await,
         Command::Export { command } => run_export(command, &config, json_output),
+        Command::Import { command } => run_import(command, &config, json_output),
         Command::Db { command } => run_db(command, &config, json_output),
     }
 }
@@ -1559,6 +1581,67 @@ fn run_export(command: ExportCommand, config: &Config, json_output: bool) -> Res
             Ok(EXIT_OK)
         }
     }
+}
+
+fn run_import(command: ImportCommand, config: &Config, json_output: bool) -> Result<i32> {
+    match command {
+        ImportCommand::Json { input, dry_run } => {
+            let export = import::load_export(&input)?;
+            let mut store = Store::open(&config.db_path)?;
+            let report = import::import_json(&mut store, export, dry_run)?;
+            let has_conflicts = !report.conflicts.is_empty();
+            if json_output {
+                print_json(&json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "import": report,
+                }))?;
+            } else {
+                print_import_report(&report);
+            }
+            Ok(if has_conflicts { EXIT_PARTIAL } else { EXIT_OK })
+        }
+    }
+}
+
+fn print_import_report(report: &crate::application::import::ImportReport) {
+    println!(
+        "Import {} (schema {}).",
+        if report.dry_run { "dry-run" } else { "result" },
+        report.schema_version
+    );
+    print_import_section("DNS measurements", &report.dns);
+    print_import_section("Route runs", &report.routes);
+    print_import_section("Sessions", &report.sessions);
+    print_import_section("Devices", &report.devices);
+    for conflict in &report.conflicts {
+        println!(
+            "  conflict {} {}: {}",
+            conflict.kind, conflict.id, conflict.message
+        );
+    }
+    for note in &report.notes {
+        println!("  note: {note}");
+    }
+    if report.conflicts.is_empty() {
+        println!("No conflicts detected.");
+    } else {
+        println!(
+            "Conflicts detected: {} (no conflicting records were overwritten).",
+            report.conflicts.len()
+        );
+    }
+}
+
+fn print_import_section(label: &str, section: &crate::application::import::SectionReport) {
+    println!(
+        "  {label}: total {}  importable {}  imported {}  skipped {}  conflicts {}  unsupported {}",
+        section.total,
+        section.importable,
+        section.imported,
+        section.skipped_existing,
+        section.conflicts,
+        section.unsupported
+    );
 }
 
 fn run_db(command: DbCommand, config: &Config, json_output: bool) -> Result<i32> {

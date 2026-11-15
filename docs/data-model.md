@@ -690,8 +690,6 @@ Implemented through Phase 4:
 
 Deferred:
 
-- The startup sweep that marks a session left in `running` from a previous process as
-  `interrupted` is not implemented. Its observations would remain valid.
 - Destructive migrations require an explicit backup step and are avoided otherwise.
 
 ## 7. Retention and freshness
@@ -734,5 +732,8 @@ historical inference can be explained.
   evidence graph, observations, per-identifier history, DNS measurements, and route runs.
 - SQLite backup/restore is implemented via the SQLite online backup API plus integrity
   verification; restore validates the backup and replaces the destination file.
-- Import remains planned: versioned, validated, dry-runnable, and transactional, with
-  duplicate detection by stable IDs/natural keys and conflict reporting (no silent merge).
+- Import is partially implemented: JSON import is validated and dry-runnable, and applies
+  non-conflicting DNS measurements and route runs transactionally by stable ID (conflicts
+  reported, never overwritten). Full conflict-aware import of sessions/devices/identifiers/
+  evidence/inferences/observations remains planned (duplicate detection by stable IDs and
+  natural keys, no silent merge).

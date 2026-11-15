@@ -7,10 +7,11 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{DeviceDetail, DeviceSummary, DnsMeasurement, RouteRun};
+use crate::application::model::SessionRecord;
+use crate::domain::{DeviceDetail, DeviceSessionSnapshot, DeviceSummary, DnsMeasurement, RouteRun};
 use crate::infrastructure::storage::{StorageError, Store};
 
 pub const EXPORT_SCHEMA_VERSION: u32 = 1;
@@ -33,16 +34,23 @@ pub enum ExportError {
     Invalid(String),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonExport {
     pub schema_version: u32,
     pub exported_at_ms: i64,
+    pub sessions: Vec<SessionExport>,
     pub devices: Vec<DeviceExport>,
     pub dns_measurements: Vec<DnsMeasurement>,
     pub route_runs: Vec<RouteRun>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionExport {
+    pub session: SessionRecord,
+    pub snapshots: Vec<DeviceSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceExport {
     pub summary: DeviceSummary,
     pub detail: Option<DeviceDetail>,
@@ -50,6 +58,13 @@ pub struct DeviceExport {
 
 /// Export the current database state as a versioned JSON document.
 pub fn export_json(store: &Store) -> Result<JsonExport, ExportError> {
+    let session_records = store.list_sessions()?;
+    let mut sessions = Vec::with_capacity(session_records.len());
+    for session in session_records {
+        let snapshots = store.load_session_snapshots(session.id)?;
+        sessions.push(SessionExport { session, snapshots });
+    }
+
     let summaries = store.list_devices(None)?;
     let mut devices = Vec::with_capacity(summaries.len());
     for summary in &summaries {
@@ -64,6 +79,7 @@ pub fn export_json(store: &Store) -> Result<JsonExport, ExportError> {
     Ok(JsonExport {
         schema_version: EXPORT_SCHEMA_VERSION,
         exported_at_ms: crate::domain::time::now_ms(),
+        sessions,
         devices,
         dns_measurements,
         route_runs,
@@ -196,6 +212,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let export = export_json(&store).unwrap();
         assert_eq!(export.schema_version, EXPORT_SCHEMA_VERSION);
+        assert!(export.sessions.is_empty());
         assert!(export.devices.is_empty());
         assert!(export.dns_measurements.is_empty());
         assert!(export.route_runs.is_empty());

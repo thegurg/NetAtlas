@@ -611,3 +611,123 @@ fn db_backup_integrity_and_restore_round_trip() {
     assert!(value["restore"]["schema_version"].as_i64().unwrap() >= 4);
     let _ = db;
 }
+
+#[test]
+fn import_json_dry_run_and_apply_route_measurement() {
+    let (dir, mut trace_cmd, _db) = command();
+    let output = trace_cmd
+        .args([
+            "route",
+            "trace",
+            "127.0.0.1",
+            "--method",
+            "udp",
+            "--max-hops",
+            "1",
+            "--probes",
+            "1",
+            "--timeout-ms",
+            "500",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() || output.status.code() == Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let export_path = dir.path().join("export.json");
+    let (mut export_cmd, _db) = command_in(&dir);
+    let output = export_cmd
+        .args([
+            "export",
+            "json",
+            "--output",
+            export_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let (mut dry_run_cmd, _db2) = command_in(&dir2);
+    let output = dry_run_cmd
+        .args([
+            "import",
+            "json",
+            "--input",
+            export_path.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["import"]["dry_run"], true);
+    assert!(report["import"]["routes"]["importable"].as_i64().unwrap() >= 1);
+    assert_eq!(report["import"]["routes"]["imported"], 0);
+
+    let (mut import_cmd, _db2) = command_in(&dir2);
+    let output = import_cmd
+        .args([
+            "import",
+            "json",
+            "--input",
+            export_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["import"]["dry_run"], false);
+    assert!(report["import"]["routes"]["imported"].as_i64().unwrap() >= 1);
+
+    let (mut history_cmd, _db2) = command_in(&dir2);
+    let history = history_cmd
+        .args(["route", "history", "--json"])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let history_value: Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert!(!history_value["history"].as_array().unwrap().is_empty());
+
+    let (mut import_cmd2, _db2) = command_in(&dir2);
+    let output = import_cmd2
+        .args([
+            "import",
+            "json",
+            "--input",
+            export_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["import"]["routes"]["skipped_existing"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
+}

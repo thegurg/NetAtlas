@@ -96,7 +96,21 @@ impl Store {
              PRAGMA synchronous = NORMAL;",
         )?;
         migrations::migrate(&mut connection)?;
-        Ok(Self { connection })
+        let mut store = Self { connection };
+        store.mark_stale_running_sessions_interrupted()?;
+        Ok(store)
+    }
+
+    /// Mark scan sessions left in `running` state by a previous process as `interrupted`.
+    /// Their observations remain valid; only the session lifecycle state is corrected.
+    fn mark_stale_running_sessions_interrupted(&mut self) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE scan_sessions
+             SET status = 'interrupted', finished_at_ms = COALESCE(finished_at_ms, ?1)
+             WHERE status = 'running'",
+            params![crate::domain::time::now_ms()],
+        )?;
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64, StorageError> {
@@ -1201,6 +1215,19 @@ impl Store {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn get_dns_measurement(&self, id: Uuid) -> Result<Option<DnsMeasurement>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT id, queried_at_ms, resolver_label, resolver_address, query_name, record_type,
+                        transport, outcome, rcode, elapsed_ms, attempts, response_json, dnssec_json, error
+                 FROM dns_measurements WHERE id = ?1",
+                params![id.to_string()],
+                dns_measurement_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn list_dns_measurements(

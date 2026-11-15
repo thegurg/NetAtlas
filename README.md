@@ -1,16 +1,15 @@
 # NetAtlas
 
-Linux-first network exploration and diagnostics in Rust, with a CLI and a TUI over one
-shared engine and SQLite history.
+Linux-first network exploration and diagnostics in Rust, with a CLI over a shared engine
+and SQLite history. (TUI planned.)
 
-> **Status: Phase 4 — DNS diagnostics.** The CLI, discovery providers, identity
-> resolution, OUI lookup, evidence/inference pipeline, mDNS, SSDP/UPnP, NetBIOS, safe
-> TCP service probes, SQLite persistence, per-session inventory snapshots, device
-> history, change detection, segment grouping, filtering, stale-data indicators, raw DNS
-> queries, resolver comparison, DNS measurement history, and explicit DNSSEC observation
-> state are implemented. The TUI, route exploration, monitoring, import/export, and
+> **Status:** Phase 5 complete; Phase 6 in progress. Discovery, identification, LAN
+> inventory/map, OUI import/lookup, DNS query/compare/history, route trace/history/
+> compare, JSON/CSV export, SQLite backup/restore/integrity, and JSON import with dry-run
+> for non-conflicting DNS/route measurements are implemented. Full conflict-aware
+> session/device identity import, scheduled monitoring/change detection, the TUI, and
 > cryptographic DNSSEC validation are not implemented yet. This README describes what
-> works now and what remains limited; it is not a claim that later-phase features exist.
+> works now and what remains limited.
 
 ## What works now
 
@@ -29,6 +28,16 @@ netatlas oui lookup 3c:cd:5d:11:22:33
 netatlas dns query example.com [--type A,AAAA] [--resolver 1.1.1.1]
 netatlas dns compare example.com --resolver system --resolver 1.1.1.1
 netatlas dns history [--name example.com] [--type A] [--resolver system]
+netatlas route trace example.com [--method udp|icmp|tcp] [--max-hops 30] [--probes 3]
+netatlas route history [--target 1.1.1.1] [--method udp]
+netatlas route compare example.com [--method udp]
+netatlas export json --output ./netatlas-export.json
+netatlas export csv --output ./devices.csv
+netatlas import json --input ./netatlas-export.json --dry-run
+netatlas import json --input ./netatlas-export.json
+netatlas db integrity
+netatlas db backup --output ./netatlas-backup.db
+netatlas db restore --input ./netatlas-backup.db [--to ./netatlas-restored.db]
 ```
 
 Every command supports `--json`, `--help`, and the documented exit codes. A global
@@ -187,11 +196,16 @@ binary and imported on first open.
   switch/AP attachment.
 - Stale records are not offline devices. A device can be present but unobserved because
   of sleep, firewall rules, client isolation, or scope limits.
-- JSON export is a point-in-time snapshot; CSV export is lossy (no evidence graph,
-  observations, identifier history, DNS, or route measurements). Exports contain
-  network observations and should be treated as sensitive data.
-- Validated transactional import with dry-run/conflict reporting, scheduled monitoring,
-  monitor-run/event storage, and automatic change-detection jobs are not implemented yet.
+- JSON export is a point-in-time snapshot including sessions/snapshots, device details,
+  DNS measurements, and route runs; CSV export is lossy (no evidence graph, observations,
+  identifier history, DNS, or route measurements). Exports/imports contain network
+  observations and should be treated as sensitive data.
+- JSON import with dry-run is implemented for non-conflicting DNS measurements and route
+  runs by stable ID (conflicts reported, never overwritten). Full conflict-aware import of
+  sessions/devices/identifiers/evidence/inference/observation graphs is not implemented yet;
+  use `db backup/restore` for full-fidelity restoration.
+- Scheduled monitoring, monitor-run/event storage, and automatic change-detection jobs are
+  not implemented yet.
 - No TUI or cryptographic DNSSEC validation yet.
 - No live-network tests run during `cargo test`; they are opt-in only.
 

@@ -317,7 +317,9 @@ Deliverables implemented:
 
 Phase 3 limitations: history begins with the first scan after migration `0002_inventory`;
 the map is logical subnet grouping, not physical topology; stale data is not an offline
-determination; change events are derived on read rather than stored.
+determination; change events are derived on read rather than stored. Stale `running`
+scan sessions are marked `interrupted` on database open so crashed scans do not remain
+indefinitely active.
 
 ### Phase 4 — DNS analysis (done)
 
@@ -367,17 +369,25 @@ are reported as measurements, never as proof of a broken route.
 
 Implemented in this slice:
 
-- Versioned JSON export (`export json`) of device summaries/details (including evidence,
-  inferences, observations, services when available), DNS measurements, and route runs.
+- Versioned JSON export (`export json`) of sessions (with snapshots), device summaries/details
+  (including evidence, inferences, observations, services when available), DNS measurements,
+  and route runs.
 - Lossy CSV export (`export csv`) of current device summaries with documented omissions.
 - SQLite maintenance commands: `db integrity`, `db backup` (online backup API + integrity
   verification), and `db restore` (validated backup, schema check, destination copy, stale
   WAL/SHM cleanup).
-- Deterministic application/storage/CLI coverage for export and backup/restore flows.
+- JSON import with dry-run (`import json --dry-run`) and transactional apply for
+  non-conflicting DNS measurements and route runs by stable ID, with conflict reporting
+  and no overwrites. Sessions/devices/identity-graph records are reported as unsupported
+  in this slice (no silent merges).
+- Stale `running` scan sessions are marked `interrupted` on database open.
+- Deterministic application/storage/CLI coverage for export, import, and backup/restore flows.
 
 Remaining Phase 6 work:
 
-- Validated, transactional import with dry-run and conflict reporting (no silent merge).
+- Full conflict-aware, transactional import with dry-run for sessions, devices, identifiers,
+  evidence, inferences, observations, and services (duplicate detection/conflict reporting,
+  no silent merge).
 - Opt-in scheduled scans/DNS checks, monitor-run/event persistence, and change-detection
   jobs/history beyond on-demand comparisons.
 
